@@ -4,6 +4,15 @@ A C++/Win32 Minesweeper: three preset levels plus a custom field, question
 marks, chording, a clock, best times, sound, a monochrome mode — and the
 XYZZY peek.
 
+![Expert board part way through a game](docs/expert.png)
+
+*Expert, 30 × 16 with 99 mines, part way through.*
+
+![Beginner board after stepping on a mine](docs/beginner.png)
+
+*Beginner, after stepping on a mine: the one you hit turns red, the rest are
+revealed, and a flag in the wrong place gets a red X.*
+
 ```bash
 build.cmd
 ```
@@ -22,6 +31,8 @@ produces `winmine.exe` next to `build.cmd`.
 | `src/miner.manifest` | side-by-side manifest for the v6 common controls |
 | `res/*.bmp`, `res/miner.ico`, `res/*.wav` | artwork and sounds |
 | `build/` | intermediate object/resource files |
+| `docs/` | the screenshots above |
+| `LICENSE` | WTFPL |
 
 ## Settings and scores
 
@@ -152,3 +163,7 @@ link line in `build.cmd`; the binary then comes out at 120,320 bytes.
 
 The project directory may contain spaces and parentheses — `build.cmd` works on
 relative paths throughout.
+
+## License
+
+[WTFPL](LICENSE) — do what the fuck you want to.
