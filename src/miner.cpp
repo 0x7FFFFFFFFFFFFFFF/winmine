@@ -1,0 +1,2034 @@
+/*=====================================================================
+    miner.cpp  --  Minesweeper.
+
+    A classic 16-pixel-per-cell Minesweeper: three preset levels plus a
+    custom field, question marks, chording, a clock, best times and the
+    XYZZY peek.  Everything is drawn with GDI straight from the bitmaps
+    in the resource file, and the whole program is one translation unit
+    that links without the C run-time (see build.cmd).
+
+    Board encoding -- one byte per cell, 32 bytes per row:
+
+        0x80            the cell contains a mine
+        0x40            the cell has been uncovered
+        0x1F            index of the tile to blit (see BLK_* below)
+
+  =====================================================================*/
+
+#define WIN32_LEAN_AND_MEAN
+#define WINVER          0x0501
+#define _WIN32_WINNT    0x0501
+
+#include <windows.h>
+#include <windowsx.h>
+#include <shellapi.h>
+#include <commctrl.h>
+#include <mmsystem.h>
+
+#include "resource.h"
+
+/*---------------------------------------------------------------------
+    geometry
+  -------------------------------------------------------------------*/
+#define DX_BLK          16      /* a field cell                       */
+#define DY_BLK          16
+#define DX_LED          13      /* one seven-segment digit            */
+#define DY_LED          23
+#define DX_BUTTON       24      /* the smiley                         */
+#define DY_BUTTON       24
+
+#define X_FIELD         12      /* first pixel column of the field    */
+#define Y_FIELD         55      /* first pixel row of the field       */
+
+#define DX_WINDOW       24      /* client width  = cBlk * 16 + this   */
+#define DY_WINDOW       67      /* client height = cRow * 16 + this   */
+
+#define Y_LED           16      /* top of the LED digits              */
+#define Y_BUTTON        16      /* top of the smiley                  */
+
+/*---------------------------------------------------------------------
+    board limits.  The board is a fixed 32-byte-per-row array, which is
+    what caps the width at 30.
+  -------------------------------------------------------------------*/
+#define BLK_STRIDE      32
+#define CBLK_ARRAY      864     /* 27 rows of 32 bytes                */
+#define CBLK_MAX        30      /* widest field                       */
+#define CROW_MAX        25      /* tallest field                      */
+
+/*---------------------------------------------------------------------
+    tile indices inside the 16-tile block bitmap
+  -------------------------------------------------------------------*/
+#define BLK_0           0       /* uncovered, no neighbouring mines   */
+#define BLK_8           8       /* uncovered, eight neighbours        */
+#define BLK_GUESSDN     9       /* '?' held down                      */
+#define BLK_BOMBUP      10      /* a mine, revealed after a loss      */
+#define BLK_WRONG       11      /* a flag that was not a mine         */
+#define BLK_EXPLODE     12      /* the mine that was stepped on       */
+#define BLK_GUESSUP     13      /* '?'                                */
+#define BLK_BOMBFLAG    14      /* flag                               */
+#define BLK_BLANKUP     15      /* untouched cell                     */
+#define BLK_BORDER      16      /* off-board sentinel                 */
+
+#define MASK_BOMB       0x80
+#define MASK_VISIT      0x40
+#define MASK_ICON       0x1F
+
+/*---------------------------------------------------------------------
+    smiley indices inside the 5-tile face bitmap
+  -------------------------------------------------------------------*/
+#define FACE_HAPPY      0
+#define FACE_CAUTION    1       /* while a cell is held down          */
+#define FACE_DEAD       2
+#define FACE_WIN        3
+#define FACE_DOWN       4       /* the button itself pressed          */
+
+/*---------------------------------------------------------------------
+    LED indices inside the 12-tile digit bitmap
+  -------------------------------------------------------------------*/
+#define LED_BLANK       10
+#define LED_MINUS       11
+
+/*---------------------------------------------------------------------
+    fStatus bits
+  -------------------------------------------------------------------*/
+#define STATUS_PLAY     0x01    /* a game is in progress              */
+#define STATUS_PAUSE    0x02    /* suspended                          */
+#define STATUS_ICON     0x08    /* minimised                          */
+#define STATUS_OVER     0x10    /* the game has finished              */
+
+/*---------------------------------------------------------------------
+    3D edge styles used by DrawBorder()
+  -------------------------------------------------------------------*/
+#define MINE_SUNK       0
+#define MINE_RAISE      1
+#define MINE_FLAT       2
+
+#define ID_TIMER        1
+
+/*---------------------------------------------------------------------
+    persisted settings
+  -------------------------------------------------------------------*/
+enum {
+    INI_DIFFICULTY = 0, INI_MINES, INI_HEIGHT,  INI_WIDTH,
+    INI_XPOS,           INI_YPOS,  INI_SOUND,   INI_MARK,
+    INI_MENU,           INI_TICK,  INI_COLOR,
+    INI_TIME1,          INI_NAME1, INI_TIME2,   INI_NAME2,
+    INI_TIME3,          INI_NAME3, INI_ALREADYPLAYED,
+    INI_COUNT
+};
+
+static const WCHAR *const c_rgszPref[INI_COUNT] = {
+    L"Difficulty", L"Mines", L"Height",  L"Width",
+    L"Xpos",       L"Ypos",  L"Sound",   L"Mark",
+    L"Menu",       L"Tick",  L"Color",
+    L"Time1",      L"Name1", L"Time2",   L"Name2",
+    L"Time3",      L"Name3", L"AlreadyPlayed"
+};
+
+/* Settings and scores live in this file, in the folder the .exe is in.
+   Nothing is ever written to the registry. */
+static const WCHAR c_szIniName[] = L"winmine.ini";
+
+/* difficulty presets: mines, height, width */
+static const int c_rgPreset[3][3] = {
+    { 10,  9,  9 },     /* beginner     */
+    { 40, 16, 16 },     /* intermediate */
+    { 99, 16, 30 }      /* expert       */
+};
+
+#define LEVEL_BEGIN     0
+#define LEVEL_INTER     1
+#define LEVEL_EXPERT    2
+#define LEVEL_CUSTOM    3
+
+/*=====================================================================
+    globals
+  =====================================================================*/
+static HINSTANCE    g_hInst;
+static HWND         g_hwnd;
+static HMENU        g_hMenu;
+static WCHAR        g_szIniFile[MAX_PATH + 16];
+
+/* --- persisted preferences --------------------------------------- */
+static int          g_wGameType = LEVEL_BEGIN;
+static int          g_cMines    = 10;      /* configured mine count   */
+static int          g_cRowCfg   = 9;       /* configured height       */
+static int          g_cBlkCfg   = 9;       /* configured width        */
+static int          g_xWindow   = 80;
+static int          g_yWindow   = 80;
+static int          g_fSound    = 0;
+static int          g_fMark     = 1;
+static int          g_fTick     = 0;
+static int          g_fMenu     = 0;
+static int          g_fColor    = 1;
+static int          g_rgTime[3] = { 999, 999, 999 };
+static WCHAR        g_rgszName[3][32];
+static int          g_fUpdateReg;
+
+/* --- the board --------------------------------------------------- */
+static BYTE         g_rgBlk[CBLK_ARRAY];
+static int          g_cBlk = 9;            /* live width              */
+static int          g_cRow = 9;            /* live height             */
+
+/* --- game state -------------------------------------------------- */
+static DWORD        g_fStatus;
+static int          g_cBlkVisit;           /* cells uncovered so far  */
+static int          g_cBlkTotal;           /* cells that must be got  */
+static int          g_cSec;                /* elapsed seconds         */
+static int          g_cBombLeft;           /* the left-hand counter   */
+static int          g_iButtonCur = FACE_HAPPY;
+static int          g_fTimer;
+static int          g_fOldTimer;
+
+/* --- mouse tracking ---------------------------------------------- */
+static int          g_fBlockTrack;         /* a button is held down   */
+static int          g_fChord;              /* two-button / shift mode */
+static int          g_fIgnoreClick;        /* swallow activating click*/
+static int          g_fInMenu;
+static int          g_xCur = -1;
+static int          g_yCur = -1;
+static int          g_iXyzzy;
+
+/* --- flood fill queue (a 100 entry ring, see StepXY) -------------- */
+static int          g_rgxVisit[100];
+static int          g_rgyVisit[100];
+static int          g_iVisitHead;
+
+/* --- window metrics ---------------------------------------------- */
+static int          g_dxWindow;            /* SM_CXBORDER + 1         */
+static int          g_dyCaption;           /* SM_CYCAPTION + 1        */
+static int          g_dyMenu;              /* SM_CYMENU + 1           */
+static int          g_dyBorder;            /* SM_CYBORDER + 1         */
+static int          g_dxClient;            /* client width            */
+static int          g_dyClient;            /* client height           */
+static int          g_dyAdjust;            /* caption (+ menu) height */
+static int          g_fFrozen;             /* suppress MoveWindow     */
+
+/* --- drawing resources ------------------------------------------- */
+static HGLOBAL      g_hresBlk, g_hresLed, g_hresFace;
+static BITMAPINFO  *g_pbmiBlk, *g_pbmiLed, *g_pbmiFace;
+static int          g_rgoffBlk[16];
+static int          g_rgoffLed[12];
+static int          g_rgoffFace[5];
+static HDC          g_rghdcBlk[16];
+static HBITMAP      g_rghbmBlk[16];
+static HPEN         g_hpenShadow;
+
+/* --- misc strings ------------------------------------------------ */
+static WCHAR        g_szClass[32];
+static WCHAR        g_szSeconds[32];       /* "%d seconds"            */
+static WCHAR        g_szAnonymous[32];
+
+/* --- HtmlHelp, resolved lazily on first use ----------------------- */
+static HMODULE      g_hmodHelp;
+static int          g_fHelpFailed;
+static FARPROC      g_pfnHtmlHelp;
+
+/*---------------------------------------------------------------------
+    forward declarations
+  -------------------------------------------------------------------*/
+static void TrackMouse(int x, int y);
+static void DoEnterName(void);
+static void DoBestTimes(void);
+static void ReportErr(UINT id);
+
+/*---------------------------------------------------------------------
+    Built without the C run-time (see build.cmd), the one library
+    routine the compiler still wants to emit is memset, for the loop
+    that blanks the board.  The volatile pointer is what stops the
+    optimiser turning this loop back into a call to itself.
+  -------------------------------------------------------------------*/
+#ifdef MINER_NO_CRT
+#ifdef _MSC_VER
+#pragma function(memset)
+#endif
+extern "C" void *memset(void *pv, int c, size_t cb)
+{
+    volatile unsigned char *pb = (volatile unsigned char *)pv;
+    while (cb--)
+        *pb++ = (unsigned char)c;
+    return pv;
+}
+#endif
+
+/*---------------------------------------------------------------------
+    The Microsoft C run-time's generator, written out longhand: this is
+    bit-for-bit what msvcrt.dll's rand() does.  Having it here means the
+    program needs no C run-time at all, which keeps the binary small.
+  -------------------------------------------------------------------*/
+static unsigned int g_randSeed = 1;
+
+static void MinerSrand(unsigned int seed)
+{
+    g_randSeed = seed;
+}
+
+static int MinerRand(void)
+{
+    g_randSeed = g_randSeed * 214013u + 2531011u;
+    return (int)((g_randSeed >> 16) & 0x7FFF);
+}
+
+/*=====================================================================
+    small helpers
+  =====================================================================*/
+static inline BYTE *PblkAt(int x, int y)
+{
+    return &g_rgBlk[x + y * BLK_STRIDE];
+}
+
+static int ClampInt(int v, int lo, int hi)
+{
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+static void LoadSz(UINT id, LPWSTR psz, int cch)
+{
+    if (LoadStringW(g_hInst, id, psz, cch) == 0)
+        ReportErr(1001);
+}
+
+static void ReportErr(UINT id)
+{
+    WCHAR szText[256];
+    WCHAR szTitle[256];
+
+    if (id < 999) {
+        LoadStringW(g_hInst, id, szText, 256);
+    } else {
+        LoadStringW(g_hInst, IDS_ERR_UNKNOWN, szTitle, 256);
+        wsprintfW(szText, szTitle, id);
+    }
+    LoadStringW(g_hInst, IDS_ERR_TITLE, szTitle, 256);
+    MessageBoxW(NULL, szText, szTitle, MB_ICONHAND);
+}
+
+/* the usable screen size, preferring the work area */
+static int DxpScreen(int fVertical)
+{
+    int d = GetSystemMetrics(fVertical ? SM_CYFULLSCREEN : SM_CXFULLSCREEN);
+    if (d != 0)
+        return d;
+    return GetSystemMetrics(fVertical ? SM_CYSCREEN : SM_CXSCREEN);
+}
+
+/*=====================================================================
+    sound
+  =====================================================================*/
+enum { SOUND_TICK = 1, SOUND_WIN = 2, SOUND_LOSE = 3 };
+
+/* 3 == the wave device answered, 2 == wanted but unavailable */
+static int FTestSound(void)
+{
+    return PlaySoundW(NULL, NULL, SND_PURGE) ? 3 : 2;
+}
+
+static void KillSound(void)
+{
+    if (g_fSound == 3)
+        PlaySoundW(NULL, NULL, SND_PURGE);
+}
+
+static void PlayTune(int iSound)
+{
+    UINT id;
+
+    if (g_fSound != 3)
+        return;
+    switch (iSound) {
+    case SOUND_TICK: id = ID_WAV_TICK; break;
+    case SOUND_WIN:  id = ID_WAV_WIN;  break;
+    case SOUND_LOSE: id = ID_WAV_LOSE; break;
+    default: return;
+    }
+    PlaySoundW((LPCWSTR)(ULONG_PTR)id, g_hInst, SND_RESOURCE | SND_ASYNC);
+}
+
+/*=====================================================================
+    preferences - winmine.ini, in the folder the .exe lives in
+  =====================================================================*/
+
+/* build the full path of winmine.ini beside the executable */
+static void InitIniPath(void)
+{
+    DWORD cch = GetModuleFileNameW(NULL, g_szIniFile, MAX_PATH);
+
+    if (cch == 0 || cch >= MAX_PATH) {
+        lstrcpyW(g_szIniFile, c_szIniName);      /* fall back to the cwd */
+        return;
+    }
+    while (cch > 0 && g_szIniFile[cch - 1] != L'\\' &&
+                      g_szIniFile[cch - 1] != L'/')
+        cch--;
+    lstrcpyW(g_szIniFile + cch, c_szIniName);
+}
+
+/* WritePrivateProfileStringW only stores UTF-16 if the file already is
+   UTF-16, so create it with a byte-order mark the first time.  Without
+   this a player whose name is not plain ASCII would get it mangled. */
+static void EnsureIniFile(void)
+{
+    static const BYTE bom[2] = { 0xFF, 0xFE };
+    HANDLE hf;
+    DWORD  cb;
+
+    if (GetFileAttributesW(g_szIniFile) != INVALID_FILE_ATTRIBUTES)
+        return;
+
+    hf = CreateFileW(g_szIniFile, GENERIC_WRITE, 0, NULL, CREATE_NEW,
+                     FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hf == INVALID_HANDLE_VALUE)
+        return;
+    WriteFile(hf, bom, sizeof(bom), &cb, NULL);
+    CloseHandle(hf);
+}
+
+static int ReadIniInt(int iPref, int dflt, int lo, int hi)
+{
+    int v = (int)GetPrivateProfileIntW(g_szClass, c_rgszPref[iPref],
+                                       (INT)dflt, g_szIniFile);
+    return ClampInt(v, lo, hi);
+}
+
+static void ReadIniSz(int iPref, LPWSTR psz)
+{
+    GetPrivateProfileStringW(g_szClass, c_rgszPref[iPref], g_szAnonymous,
+                             psz, 32, g_szIniFile);
+}
+
+static void WriteIniInt(int iPref, int v)
+{
+    WCHAR sz[16];
+    wsprintfW(sz, L"%d", v);
+    WritePrivateProfileStringW(g_szClass, c_rgszPref[iPref], sz, g_szIniFile);
+}
+
+static void WriteIniSz(int iPref, LPCWSTR psz)
+{
+    WritePrivateProfileStringW(g_szClass, c_rgszPref[iPref], psz, g_szIniFile);
+}
+
+static void WritePreferences(void)
+{
+    EnsureIniFile();
+
+    WriteIniInt(INI_DIFFICULTY,     g_wGameType);
+    WriteIniInt(INI_HEIGHT,         g_cRowCfg);
+    WriteIniInt(INI_WIDTH,          g_cBlkCfg);
+    WriteIniInt(INI_MINES,          g_cMines);
+    WriteIniInt(INI_MARK,           g_fMark);
+    WriteIniInt(INI_ALREADYPLAYED,  1);
+    WriteIniInt(INI_COLOR,          g_fColor);
+    WriteIniInt(INI_SOUND,          g_fSound);
+    WriteIniInt(INI_XPOS,           g_xWindow);
+    WriteIniInt(INI_YPOS,           g_yWindow);
+    WriteIniInt(INI_TIME1,          g_rgTime[0]);
+    WriteIniInt(INI_TIME2,          g_rgTime[1]);
+    WriteIniInt(INI_TIME3,          g_rgTime[2]);
+    WriteIniSz (INI_NAME1,          g_rgszName[0]);
+    WriteIniSz (INI_NAME2,          g_rgszName[1]);
+    WriteIniSz (INI_NAME3,          g_rgszName[2]);
+
+    /* flush the cache Windows keeps for .ini files */
+    WritePrivateProfileStringW(NULL, NULL, NULL, g_szIniFile);
+}
+
+static int FIsColourScreen(void)
+{
+    HWND hwndDesk = GetDesktopWindow();
+    HDC  hdc      = GetDC(hwndDesk);
+    int  bpp      = GetDeviceCaps(hdc, BITSPIXEL);
+    ReleaseDC(hwndDesk, hdc);
+    return bpp != 2;
+}
+
+static void ReadPreferences(void)
+{
+    g_cRow = g_cRowCfg = ReadIniInt(INI_HEIGHT,     9,  9, CROW_MAX);
+    g_cBlk = g_cBlkCfg = ReadIniInt(INI_WIDTH,      9,  9, CBLK_MAX);
+    g_wGameType        = ReadIniInt(INI_DIFFICULTY, 0,  0, 3);
+    g_cMines           = ReadIniInt(INI_MINES,     10, 10, 999);
+    g_xWindow          = ReadIniInt(INI_XPOS,      80,  0, 1024);
+    g_yWindow          = ReadIniInt(INI_YPOS,      80,  0, 1024);
+    g_fSound           = ReadIniInt(INI_SOUND,      0,  0, 3);
+    g_fMark            = ReadIniInt(INI_MARK,       1,  0, 1);
+    g_fTick            = ReadIniInt(INI_TICK,       0,  0, 1);
+    g_fMenu            = ReadIniInt(INI_MENU,       0,  0, 2);
+    g_rgTime[0]        = ReadIniInt(INI_TIME1,    999,  0, 999);
+    g_rgTime[1]        = ReadIniInt(INI_TIME2,    999,  0, 999);
+    g_rgTime[2]        = ReadIniInt(INI_TIME3,    999,  0, 999);
+    ReadIniSz(INI_NAME1, g_rgszName[0]);
+    ReadIniSz(INI_NAME2, g_rgszName[1]);
+    ReadIniSz(INI_NAME3, g_rgszName[2]);
+    g_fColor           = ReadIniInt(INI_COLOR, FIsColourScreen(), 0, 1);
+
+    if (g_fSound == 3)
+        g_fSound = FTestSound();
+}
+
+/* First run: write winmine.ini so everything read back later is there */
+static void InitPreferences(void)
+{
+    int fAlreadyPlayed;
+
+    MinerSrand(GetTickCount() & 0xFFFF);
+
+    InitIniPath();
+    LoadSz(IDS_NAME,      g_szClass,     32);
+    LoadSz(IDS_SECONDS,   g_szSeconds,   32);
+    LoadSz(IDS_ANONYMOUS, g_szAnonymous, 32);
+
+    g_dyCaption = GetSystemMetrics(SM_CYCAPTION) + 1;
+    g_dyMenu    = GetSystemMetrics(SM_CYMENU)    + 1;
+    g_dyBorder  = GetSystemMetrics(SM_CYBORDER)  + 1;
+    g_dxWindow  = GetSystemMetrics(SM_CXBORDER)  + 1;
+
+    fAlreadyPlayed = ReadIniInt(INI_ALREADYPLAYED, 0, 0, 1);
+    if (fAlreadyPlayed)
+        return;
+
+    g_cRowCfg   = 9;
+    g_cBlkCfg   = 9;
+    g_wGameType = LEVEL_BEGIN;
+    g_cMines    = 10;
+    g_xWindow   = 80;
+    g_yWindow   = 80;
+    g_fSound    = 0;
+    g_fMark     = 1;
+    g_fTick     = 0;
+    g_fMenu     = 0;
+    g_rgTime[0] = g_rgTime[1] = g_rgTime[2] = 999;
+    lstrcpyW(g_rgszName[0], g_szAnonymous);
+    lstrcpyW(g_rgszName[1], g_szAnonymous);
+    lstrcpyW(g_rgszName[2], g_szAnonymous);
+    g_fColor    = FIsColourScreen();
+
+    WritePreferences();
+}
+
+/*=====================================================================
+    bitmaps
+  =====================================================================*/
+/* the monochrome variant always follows the colour one */
+static HRSRC FindBmp(int id)
+{
+    return FindResourceW(g_hInst,
+                         MAKEINTRESOURCEW(id + (g_fColor == 0)),
+                         (LPCWSTR)RT_BITMAP);
+}
+
+/* size in bytes of one tile of the given dimensions */
+static int CbTile(int dx, int dy)
+{
+    int cBits = g_fColor ? 4 : 1;
+    return ((((cBits * dx) + 31) >> 3) & ~3) * dy;
+}
+
+/* offset from the start of the BITMAPINFO to the first pixel */
+static int CbHeader(void)
+{
+    return (int)sizeof(BITMAPINFOHEADER) +
+           (g_fColor ? 16 : 2) * (int)sizeof(RGBQUAD);
+}
+
+static void FreeBmp(void)
+{
+    int i;
+
+    if (g_hpenShadow) {
+        DeleteObject(g_hpenShadow);
+        g_hpenShadow = NULL;
+    }
+    for (i = 0; i < 16; i++) {
+        if (g_rghdcBlk[i]) { DeleteDC(g_rghdcBlk[i]);     g_rghdcBlk[i] = NULL; }
+        if (g_rghbmBlk[i]) { DeleteObject(g_rghbmBlk[i]); g_rghbmBlk[i] = NULL; }
+    }
+}
+
+static BOOL FLoadBmp(void)
+{
+    HRSRC hrsrc;
+    HDC   hdc;
+    int   cb, i;
+
+    g_hresBlk = g_hresLed = g_hresFace = NULL;
+
+    if ((hrsrc = FindBmp(ID_BMP_BLOCKS)) != NULL)
+        g_hresBlk = LoadResource(g_hInst, hrsrc);
+    if ((hrsrc = FindBmp(ID_BMP_LED)) != NULL)
+        g_hresLed = LoadResource(g_hInst, hrsrc);
+    if ((hrsrc = FindBmp(ID_BMP_FACE)) != NULL)
+        g_hresFace = LoadResource(g_hInst, hrsrc);
+
+    if (!g_hresBlk || !g_hresLed || !g_hresFace)
+        return FALSE;
+
+    g_pbmiBlk  = (BITMAPINFO *)LockResource(g_hresBlk);
+    g_pbmiLed  = (BITMAPINFO *)LockResource(g_hresLed);
+    g_pbmiFace = (BITMAPINFO *)LockResource(g_hresFace);
+    if (!g_pbmiBlk || !g_pbmiLed || !g_pbmiFace)
+        return FALSE;
+
+    g_hpenShadow = CreatePen(PS_SOLID, 1,
+                             g_fColor ? RGB(0x80, 0x80, 0x80) : RGB(0, 0, 0));
+
+    cb = CbTile(DX_BLK, DY_BLK);
+    for (i = 0; i < 16; i++)
+        g_rgoffBlk[i] = CbHeader() + i * cb;
+
+    cb = CbTile(DX_LED, DY_LED);
+    for (i = 0; i < 12; i++)
+        g_rgoffLed[i] = CbHeader() + i * cb;
+
+    cb = CbTile(DX_BUTTON, DY_BUTTON);
+    for (i = 0; i < 5; i++)
+        g_rgoffFace[i] = CbHeader() + i * cb;
+
+    /* pre-render the sixteen field tiles into memory DCs */
+    hdc = GetDC(g_hwnd);
+    for (i = 0; i < 16; i++) {
+        g_rghdcBlk[i] = CreateCompatibleDC(hdc);
+        g_rghbmBlk[i] = CreateCompatibleBitmap(hdc, DX_BLK, DY_BLK);
+        if (!g_rghdcBlk[i] || !g_rghbmBlk[i]) {
+            ReleaseDC(g_hwnd, hdc);
+            return FALSE;
+        }
+        SelectObject(g_rghdcBlk[i], g_rghbmBlk[i]);
+        SetDIBitsToDevice(g_rghdcBlk[i], 0, 0, DX_BLK, DY_BLK, 0, 0,
+                          0, DY_BLK,
+                          (const BYTE *)g_pbmiBlk + g_rgoffBlk[i],
+                          g_pbmiBlk, DIB_RGB_COLORS);
+    }
+    ReleaseDC(g_hwnd, hdc);
+    return TRUE;
+}
+
+/*=====================================================================
+    drawing
+  =====================================================================*/
+static void DisplayBlk(int x, int y)
+{
+    HDC hdc = GetDC(g_hwnd);
+    BitBlt(hdc, x * DX_BLK - 4, y * DY_BLK + 39, DX_BLK, DY_BLK,
+           g_rghdcBlk[*PblkAt(x, y) & MASK_ICON], 0, 0, SRCCOPY);
+    ReleaseDC(g_hwnd, hdc);
+}
+
+static void DrawField(HDC hdc)
+{
+    int x, y, xPix, yPix;
+
+    yPix = Y_FIELD;
+    for (y = 1; y <= g_cRow; y++) {
+        xPix = X_FIELD;
+        for (x = 1; x <= g_cBlk; x++) {
+            BitBlt(hdc, xPix, yPix, DX_BLK, DY_BLK,
+                   g_rghdcBlk[*PblkAt(x, y) & MASK_ICON], 0, 0, SRCCOPY);
+            xPix += DX_BLK;
+        }
+        yPix += DY_BLK;
+    }
+}
+
+static void DisplayField(void)
+{
+    HDC hdc = GetDC(g_hwnd);
+    DrawField(hdc);
+    ReleaseDC(g_hwnd, hdc);
+}
+
+static void DrawLed(HDC hdc, int x, int iLed)
+{
+    SetDIBitsToDevice(hdc, x, Y_LED, DX_LED, DY_LED, 0, 0, 0, DY_LED,
+                      (const BYTE *)g_pbmiLed + g_rgoffLed[iLed],
+                      g_pbmiLed, DIB_RGB_COLORS);
+}
+
+static void DrawBombCount(HDC hdc)
+{
+    DWORD dwLayout = GetLayout(hdc);
+    int   iHundred, n;
+
+    if (dwLayout & LAYOUT_RTL)
+        SetLayout(hdc, 0);
+
+    if (g_cBombLeft < 0) {
+        iHundred = LED_MINUS;
+        n        = -g_cBombLeft;
+    } else {
+        iHundred = g_cBombLeft / 100;
+        n        = g_cBombLeft;
+    }
+    DrawLed(hdc, 17, iHundred);
+    DrawLed(hdc, 30, (n % 100) / 10);
+    DrawLed(hdc, 43, (n % 100) % 10);
+
+    if (dwLayout & LAYOUT_RTL)
+        SetLayout(hdc, dwLayout);
+}
+
+static void DisplayBombCount(void)
+{
+    HDC hdc = GetDC(g_hwnd);
+    DrawBombCount(hdc);
+    ReleaseDC(g_hwnd, hdc);
+}
+
+static void DrawTime(HDC hdc)
+{
+    DWORD dwLayout = GetLayout(hdc);
+    int   x        = g_dxClient - g_dxWindow;
+    int   n        = g_cSec;
+
+    if (dwLayout & LAYOUT_RTL)
+        SetLayout(hdc, 0);
+
+    DrawLed(hdc, x - 0x38, n / 100);
+    DrawLed(hdc, x - 0x2B, (n % 100) / 10);
+    DrawLed(hdc, x - 0x1E, (n % 100) % 10);
+
+    if (dwLayout & LAYOUT_RTL)
+        SetLayout(hdc, dwLayout);
+}
+
+static void DisplayTime(void)
+{
+    HDC hdc = GetDC(g_hwnd);
+    DrawTime(hdc);
+    ReleaseDC(g_hwnd, hdc);
+}
+
+static void DrawButton(HDC hdc, int iFace)
+{
+    SetDIBitsToDevice(hdc, (g_dxClient - DX_BUTTON) >> 1, Y_BUTTON,
+                      DX_BUTTON, DY_BUTTON, 0, 0, 0, DY_BUTTON,
+                      (const BYTE *)g_pbmiFace + g_rgoffFace[iFace],
+                      g_pbmiFace, DIB_RGB_COLORS);
+}
+
+static void DisplayButton(int iFace)
+{
+    HDC hdc = GetDC(g_hwnd);
+    DrawButton(hdc, iFace);
+    ReleaseDC(g_hwnd, hdc);
+}
+
+/*---------------------------------------------------------------------
+    The 3D edges.  Highlights are drawn with R2_WHITE (so the pen
+    colour does not matter); shadows use a grey pen with R2_COPYPEN.
+    LineTo() stops one pixel short of its end point, which is why the
+    corners are stepped the way they are.
+  -------------------------------------------------------------------*/
+static void SetEdgePen(HDC hdc, int fHighlight)
+{
+    if (fHighlight & 1) {
+        SetROP2(hdc, R2_WHITE);
+    } else {
+        SetROP2(hdc, R2_COPYPEN);
+        SelectObject(hdc, g_hpenShadow);
+    }
+}
+
+static void DrawBorder(HDC hdc, int x1, int y1, int x2, int y2,
+                       int cThick, int iStyle)
+{
+    int c = 0;
+
+    SetEdgePen(hdc, iStyle);
+
+    if (cThick > 0) {
+        int n = cThick;
+        c = cThick;
+        do {
+            y2--;
+            MoveToEx(hdc, x1, y2, NULL);
+            LineTo(hdc, x1, y1);
+            x1++;
+            LineTo(hdc, x2, y1);
+            x2--;
+            y1++;
+        } while (--n != 0);
+    }
+
+    if (iStyle < MINE_FLAT)
+        SetEdgePen(hdc, iStyle ^ 1);
+
+    for (; c != 0; c--) {
+        y2++;
+        MoveToEx(hdc, x1, y2, NULL);
+        x1--;
+        x2++;
+        LineTo(hdc, x2, y2);
+        y1--;
+        LineTo(hdc, x2, y1);
+    }
+}
+
+static void DrawBackground(HDC hdc)
+{
+    int dx = g_dxClient;
+    int dy = g_dyClient;
+    int xFace;
+
+    /* outer frame */
+    DrawBorder(hdc, 0, 0, dx - 1, dy - 1, 3, MINE_RAISE);
+    /* the mine field */
+    DrawBorder(hdc, 9, 0x34, dx - 10, dy - 10, 3, MINE_SUNK);
+    /* the status panel */
+    DrawBorder(hdc, 9, 9, dx - 10, 0x2D, 2, MINE_SUNK);
+    /* the two LED displays */
+    DrawBorder(hdc, 0x10, 0x0F, 0x38, 0x27, 1, MINE_SUNK);
+    DrawBorder(hdc, (dx - g_dxWindow) - 0x39, 0x0F,
+                    (dx - g_dxWindow) - 0x11, 0x27, 1, MINE_SUNK);
+    /* the smiley */
+    xFace = (dx - DX_BUTTON) >> 1;
+    DrawBorder(hdc, xFace - 1, 0x0F, xFace + DX_BUTTON, 0x28, 1, MINE_FLAT);
+}
+
+static void DrawScreen(HDC hdc)
+{
+    DrawBackground(hdc);
+    DrawBombCount(hdc);
+    DrawButton(hdc, g_iButtonCur);
+    DrawTime(hdc);
+    DrawField(hdc);
+}
+
+static void DisplayScreen(void)
+{
+    HDC hdc = GetDC(g_hwnd);
+    DrawScreen(hdc);
+    ReleaseDC(g_hwnd, hdc);
+}
+
+/*=====================================================================
+    window sizing
+  =====================================================================*/
+#define ADJUST_SHOW     1
+#define ADJUST_MOVE     2
+#define ADJUST_PAINT    4
+
+/* TRUE when the menu bar has wrapped onto a second line */
+static BOOL FMenuWrapped(void)
+{
+    RECT r0, r1;
+
+    if (g_hMenu == NULL || GetMenu(g_hwnd) == NULL)
+        return FALSE;
+    if (!GetMenuItemRect(g_hwnd, g_hMenu, 0, &r0)) return FALSE;
+    if (!GetMenuItemRect(g_hwnd, g_hMenu, 1, &r1)) return FALSE;
+    return r0.top != r1.top;
+}
+
+/* place the frame so that the client area lands exactly on
+   (g_xWindow, g_yWindow) and measures g_dxClient x g_dyClient */
+static void MoveToClient(void)
+{
+    RECT  rc;
+    DWORD dwStyle = (DWORD)GetWindowLongPtrW(g_hwnd, GWL_STYLE);
+
+    SetRect(&rc, 0, 0, g_dxClient, g_dyClient);
+    AdjustWindowRect(&rc, dwStyle, GetMenu(g_hwnd) != NULL);
+    MoveWindow(g_hwnd, g_xWindow + rc.left, g_yWindow + rc.top,
+               rc.right - rc.left, rc.bottom - rc.top, TRUE);
+}
+
+static void AdjustWindow(UINT wFlags)
+{
+    BOOL fWrapCheck = FALSE;
+    int  d;
+
+    if (g_hwnd == NULL)
+        return;
+
+    g_dyAdjust = g_dyCaption;
+    if ((g_fMenu & 1) == 0) {
+        g_dyAdjust = g_dyMenu + g_dyCaption;
+        if (FMenuWrapped()) {
+            g_dyAdjust += g_dyMenu;
+            fWrapCheck = TRUE;
+        }
+    }
+
+    g_dxClient = g_cBlk * DX_BLK + DX_WINDOW;
+    g_dyClient = g_cRow * DY_BLK + DY_WINDOW;
+
+    d = g_dxClient + g_xWindow - DxpScreen(0);
+    if (d > 0) { wFlags |= ADJUST_MOVE; g_xWindow -= d; }
+    d = g_dyClient + g_yWindow - DxpScreen(1);
+    if (d > 0) { wFlags |= ADJUST_MOVE; g_yWindow -= d; }
+
+    if (g_fFrozen)
+        return;
+
+    if (wFlags & ADJUST_MOVE)
+        MoveToClient();
+
+    /* a wider window may have un-wrapped the menu bar */
+    if (fWrapCheck && !FMenuWrapped()) {
+        g_dyAdjust -= g_dyMenu;
+        MoveToClient();
+    }
+
+    if (wFlags & ADJUST_PAINT) {
+        RECT rc;
+        SetRect(&rc, 0, 0, g_dxClient, g_dyClient);
+        InvalidateRect(g_hwnd, &rc, TRUE);
+    }
+}
+
+/*=====================================================================
+    menus
+  =====================================================================*/
+static void CheckItem(UINT id, int fCheck)
+{
+    CheckMenuItem(g_hMenu, id, fCheck ? MF_CHECKED : MF_UNCHECKED);
+}
+
+static void FixMenus(void)
+{
+    CheckItem(IDM_BEGIN,  g_wGameType == LEVEL_BEGIN);
+    CheckItem(IDM_INTER,  g_wGameType == LEVEL_INTER);
+    CheckItem(IDM_EXPERT, g_wGameType == LEVEL_EXPERT);
+    CheckItem(IDM_CUSTOM, g_wGameType == LEVEL_CUSTOM);
+    CheckItem(IDM_COLOR,  g_fColor);
+    CheckItem(IDM_MARK,   g_fMark);
+    CheckItem(IDM_SOUND,  g_fSound);
+}
+
+static void SetMenuBar(UINT fMenu)
+{
+    g_fMenu = (int)fMenu;
+    FixMenus();
+    SetMenu(g_hwnd, (g_fMenu & 1) ? NULL : g_hMenu);
+    AdjustWindow(ADJUST_MOVE);
+}
+
+/*=====================================================================
+    the board
+  =====================================================================*/
+static void InitBlks(void)
+{
+    int i;
+
+    for (i = 0; i < CBLK_ARRAY; i++)
+        g_rgBlk[i] = BLK_BLANKUP;
+
+    for (i = 0; i < g_cBlk + 2; i++) {
+        *PblkAt(i, 0)          = BLK_BORDER;
+        *PblkAt(i, g_cRow + 1) = BLK_BORDER;
+    }
+    for (i = 0; i < g_cRow + 2; i++) {
+        *PblkAt(0, i)          = BLK_BORDER;
+        *PblkAt(g_cBlk + 1, i) = BLK_BORDER;
+    }
+}
+
+/* set a cell's tile (keeping the mine bit) and repaint it */
+static void ChangeBlk(int x, int y, BYTE bTile)
+{
+    BYTE *pblk = PblkAt(x, y);
+    *pblk = (BYTE)((*pblk & 0xE0) | bTile);
+    DisplayBlk(x, y);
+}
+
+static int CountBombs(int x, int y)
+{
+    int c = 0, i, j;
+
+    for (j = y - 1; j <= y + 1; j++)
+        for (i = x - 1; i <= x + 1; i++)
+            if (*PblkAt(i, j) & MASK_BOMB)
+                c++;
+    return c;
+}
+
+static int CountMarks(int x, int y)
+{
+    int c = 0, i, j;
+
+    for (j = y - 1; j <= y + 1; j++)
+        for (i = x - 1; i <= x + 1; i++)
+            if ((*PblkAt(i, j) & MASK_ICON) == BLK_BOMBFLAG)
+                c++;
+    return c;
+}
+
+/* reveal what is left: BLK_BOMBUP after a loss, BLK_BOMBFLAG after a
+   win; flags that turned out to be wrong become BLK_WRONG */
+static void ShowBombs(BYTE bTile)
+{
+    int x, y;
+
+    for (y = 1; y <= g_cRow; y++) {
+        for (x = 1; x <= g_cBlk; x++) {
+            BYTE *pblk = PblkAt(x, y);
+            BYTE  blk  = *pblk;
+
+            if (blk & MASK_VISIT)
+                continue;
+            if (blk & MASK_BOMB) {
+                if ((blk & MASK_ICON) != BLK_BOMBFLAG)
+                    *pblk = (BYTE)((blk & 0xE0) | bTile);
+            } else if ((blk & MASK_ICON) == BLK_BOMBFLAG) {
+                *pblk = (BYTE)((blk & 0xE0) | BLK_WRONG);
+            }
+        }
+    }
+    DisplayField();
+}
+
+/* a covered cell drawn pushed in / popped out */
+static void PushBlk(int x, int y)
+{
+    BYTE *pblk  = PblkAt(x, y);
+    BYTE  bTile = (BYTE)(*pblk & MASK_ICON);
+
+    if (bTile == BLK_GUESSUP)      bTile = BLK_GUESSDN;
+    else if (bTile == BLK_BLANKUP) bTile = BLK_0;
+    *pblk = (BYTE)((*pblk & 0xE0) | bTile);
+}
+
+static void PopBlk(int x, int y)
+{
+    BYTE *pblk  = PblkAt(x, y);
+    BYTE  bTile = (BYTE)(*pblk & MASK_ICON);
+
+    if (bTile == BLK_GUESSDN) bTile = BLK_GUESSUP;
+    else if (bTile == BLK_0)  bTile = BLK_BLANKUP;
+    *pblk = (BYTE)((*pblk & 0xE0) | bTile);
+}
+
+/*---------------------------------------------------------------------
+    flood fill.  The original uses a 100-entry ring buffer rather than
+    recursion; empty cells push their coordinates and the caller walks
+    the ring uncovering all eight neighbours of each.
+  -------------------------------------------------------------------*/
+static void StepBlk(int x, int y)
+{
+    BYTE *pblk = PblkAt(x, y);
+    BYTE  bTile;
+    int   c;
+
+    if (*pblk & MASK_VISIT)
+        return;
+    bTile = (BYTE)(*pblk & MASK_ICON);
+    if (bTile == BLK_BORDER || bTile == BLK_BOMBFLAG)
+        return;
+
+    g_cBlkVisit++;
+    c = CountBombs(x, y);
+    *pblk = (BYTE)(c | MASK_VISIT);
+    DisplayBlk(x, y);
+
+    if (c == 0) {
+        g_rgxVisit[g_iVisitHead] = x;
+        g_rgyVisit[g_iVisitHead] = y;
+        if (++g_iVisitHead == 100)
+            g_iVisitHead = 0;
+    }
+}
+
+static void StepXY(int x, int y)
+{
+    int i = 1;
+
+    g_iVisitHead = 1;
+    StepBlk(x, y);
+    if (g_iVisitHead == 1)
+        return;
+
+    do {
+        int xT = g_rgxVisit[i];
+        int yT = g_rgyVisit[i];
+
+        StepBlk(xT - 1, yT - 1);
+        StepBlk(xT,     yT - 1);
+        StepBlk(xT + 1, yT - 1);
+        StepBlk(xT - 1, yT);
+        StepBlk(xT + 1, yT);
+        StepBlk(xT - 1, yT + 1);
+        StepBlk(xT,     yT + 1);
+        StepBlk(xT + 1, yT + 1);
+
+        if (++i == 100)
+            i = 0;
+    } while (i != g_iVisitHead);
+}
+
+/*=====================================================================
+    the game
+  =====================================================================*/
+static void UpdateBombCount(int d)
+{
+    g_cBombLeft += d;
+    DisplayBombCount();
+}
+
+static void GameOver(int fWon)
+{
+    g_fTimer     = 0;
+    g_iButtonCur = fWon ? FACE_WIN : FACE_DEAD;
+    DisplayButton(g_iButtonCur);
+
+    ShowBombs((BYTE)(fWon ? BLK_BOMBFLAG : BLK_BOMBUP));
+
+    if (fWon && g_cBombLeft != 0)
+        UpdateBombCount(-g_cBombLeft);
+
+    PlayTune(fWon ? SOUND_WIN : SOUND_LOSE);
+    g_fStatus = STATUS_OVER;
+
+    if (fWon && g_wGameType != LEVEL_CUSTOM) {
+        if (g_cSec < g_rgTime[g_wGameType]) {
+            g_rgTime[g_wGameType] = g_cSec;
+            DoEnterName();
+            DoBestTimes();
+        }
+    }
+}
+
+static void StartGame(void)
+{
+    UINT wFlags;
+    int  n;
+
+    g_fTimer = 0;
+
+    wFlags = (g_cBlkCfg == g_cBlk && g_cRowCfg == g_cRow)
+             ? ADJUST_PAINT : (ADJUST_MOVE | ADJUST_PAINT);
+
+    g_cBlk = g_cBlkCfg;
+    g_cRow = g_cRowCfg;
+
+    InitBlks();
+    g_iButtonCur = FACE_HAPPY;
+
+    for (n = g_cMines; n > 0; n--) {
+        int x, y;
+        do {
+            x = MinerRand() % g_cBlk;
+            y = MinerRand() % g_cRow;
+        } while (*PblkAt(x + 1, y + 1) & MASK_BOMB);
+        *PblkAt(x + 1, y + 1) |= MASK_BOMB;
+    }
+
+    g_cBlkTotal = g_cRow * g_cBlk - g_cMines;
+    g_cSec      = 0;
+    g_cBombLeft = g_cMines;
+    g_cBlkVisit = 0;
+    g_fStatus   = STATUS_PLAY;
+
+    UpdateBombCount(0);
+    AdjustWindow(wFlags);
+}
+
+/* left click on an unmarked covered cell */
+static void StepSquare(int x, int y)
+{
+    int fWon;
+
+    if ((*PblkAt(x, y) & MASK_BOMB) == 0) {
+        StepXY(x, y);
+        if (g_cBlkVisit != g_cBlkTotal)
+            return;
+        fWon = 1;
+    } else {
+        /* the very first cell uncovered is never a mine: the mine is
+           moved to the first free square.  Note the scan deliberately
+           stops one short of the last row and column. */
+        if (g_cBlkVisit == 0) {
+            int i, j;
+
+            if (g_cRow < 2)
+                return;
+            for (j = 1; j < g_cRow; j++) {
+                for (i = 1; i < g_cBlk; i++) {
+                    if ((*PblkAt(i, j) & MASK_BOMB) == 0) {
+                        *PblkAt(x, y)  = BLK_BLANKUP;
+                        *PblkAt(i, j) |= MASK_BOMB;
+                        StepXY(x, y);
+                        return;
+                    }
+                }
+            }
+            return;
+        }
+        ChangeBlk(x, y, (BYTE)(MASK_VISIT | BLK_EXPLODE));
+        fWon = 0;
+    }
+    GameOver(fWon);
+}
+
+/* both buttons (or shift) over an uncovered numbered cell */
+static void StepBlock(int x, int y)
+{
+    BYTE blk   = *PblkAt(x, y);
+    int  fBoom = 0;
+    int  i, j;
+
+    if ((blk & MASK_VISIT) == 0 ||
+        (blk & MASK_ICON) != (BYTE)CountMarks(x, y)) {
+        TrackMouse(-2, -2);         /* just pop the cells back out */
+        return;
+    }
+
+    for (j = y - 1; j <= y + 1; j++) {
+        for (i = x - 1; i <= x + 1; i++) {
+            BYTE b = *PblkAt(i, j);
+            if ((b & MASK_ICON) == BLK_BOMBFLAG || (b & MASK_BOMB) == 0) {
+                StepXY(i, j);
+            } else {
+                fBoom = 1;
+                ChangeBlk(i, j, (BYTE)(MASK_VISIT | BLK_EXPLODE));
+            }
+        }
+    }
+
+    if (fBoom) {
+        GameOver(0);
+        return;
+    }
+    if (g_cBlkVisit != g_cBlkTotal)
+        return;
+    GameOver(1);
+}
+
+/* right click: blank -> flag -> '?' -> blank */
+static void MarkSquare(int x, int y)
+{
+    BYTE blk, bTile;
+    int  d      = 0;
+    int  fCount = 1;
+
+    if (x < 1 || y < 1 || x > g_cBlk || y > g_cRow)
+        return;
+
+    blk = *PblkAt(x, y);
+    if (blk & MASK_VISIT)
+        return;
+
+    switch (blk & MASK_ICON) {
+    case BLK_BOMBFLAG:
+        d     = 1;
+        bTile = (BYTE)(g_fMark ? BLK_GUESSUP : BLK_BLANKUP);
+        break;
+    case BLK_GUESSUP:
+        bTile  = BLK_BLANKUP;
+        fCount = 0;
+        break;
+    default:
+        d     = -1;
+        bTile = BLK_BOMBFLAG;
+        break;
+    }
+
+    if (fCount)
+        UpdateBombCount(d);
+    ChangeBlk(x, y, bTile);
+
+    if ((*PblkAt(x, y) & MASK_ICON) == BLK_BOMBFLAG &&
+        g_cBlkVisit == g_cBlkTotal)
+        GameOver(1);
+}
+
+/*---------------------------------------------------------------------
+    mouse tracking: push in / pop out the cell (or the 3x3 block when
+    chording) under the cursor
+  -------------------------------------------------------------------*/
+static void TrackMouse(int x, int y)
+{
+    int xOld = g_xCur;
+    int yOld = g_yCur;
+
+    if (x == xOld && y == yOld)
+        return;
+
+    g_xCur = x;
+    g_yCur = y;
+
+    if (!g_fChord) {
+        if (xOld > 0 && yOld > 0 && xOld <= g_cBlk && yOld <= g_cRow &&
+            (*PblkAt(xOld, yOld) & MASK_VISIT) == 0) {
+            PopBlk(xOld, yOld);
+            DisplayBlk(xOld, yOld);
+        }
+        if (x > 0 && y > 0 && x <= g_cBlk && y <= g_cRow &&
+            (*PblkAt(x, y) & MASK_VISIT) == 0 &&
+            (*PblkAt(x, y) & MASK_ICON) != BLK_BOMBFLAG) {
+            PushBlk(x, y);
+            DisplayBlk(x, y);
+        }
+        return;
+    }
+
+    {
+        BOOL fNew = (x >= 1 && y >= 1 && x <= g_cBlk && y <= g_cRow);
+        BOOL fOld = (xOld >= 1 && yOld >= 1 && xOld <= g_cBlk && yOld <= g_cRow);
+        int  yOld1, yOld2, yNew1, yNew2;
+        int  xOld1, xOld2, xNew1, xNew2;
+        int  i, j;
+
+        yOld1 = (yOld - 1 < 2)       ? 1      : yOld - 1;
+        yOld2 = (yOld + 1 >= g_cRow) ? g_cRow : yOld + 1;
+        yNew1 = (y - 1 < 2)          ? 1      : y - 1;
+        yNew2 = (y + 1 >= g_cRow)    ? g_cRow : y + 1;
+        xOld1 = (xOld - 1 < 2)       ? 1      : xOld - 1;
+        xOld2 = (xOld + 1 >= g_cBlk) ? g_cBlk : xOld + 1;
+        xNew1 = (x - 1 < 2)          ? 1      : x - 1;
+        xNew2 = (x + 1 >= g_cBlk)    ? g_cBlk : x + 1;
+
+        if (fOld)
+            for (j = yOld1; j <= yOld2; j++)
+                for (i = xOld1; i <= xOld2; i++)
+                    if ((*PblkAt(i, j) & MASK_VISIT) == 0)
+                        PopBlk(i, j);
+        if (fNew)
+            for (j = yNew1; j <= yNew2; j++)
+                for (i = xNew1; i <= xNew2; i++)
+                    if ((*PblkAt(i, j) & MASK_VISIT) == 0)
+                        PushBlk(i, j);
+        if (fOld)
+            for (j = yOld1; j <= yOld2; j++)
+                for (i = xOld1; i <= xOld2; i++)
+                    DisplayBlk(i, j);
+        if (fNew)
+            for (j = yNew1; j <= yNew2; j++)
+                for (i = xNew1; i <= xNew2; i++)
+                    DisplayBlk(i, j);
+    }
+}
+
+/* a mouse button came back up over the field */
+static void DoButton1Up(void)
+{
+    if (g_xCur > 0 && g_yCur > 0 && g_xCur <= g_cBlk && g_yCur <= g_cRow) {
+
+        if (g_cBlkVisit == 0 && g_cSec == 0) {
+            PlayTune(SOUND_TICK);
+            g_cSec++;
+            DisplayTime();
+            g_fTimer = 1;
+            if (SetTimer(g_hwnd, ID_TIMER, 1000, NULL) == 0)
+                ReportErr(IDS_ERR_TIMER);
+        }
+
+        if (g_fStatus & STATUS_PLAY) {
+            if (!g_fChord) {
+                BYTE blk = *PblkAt(g_xCur, g_yCur);
+                if ((blk & MASK_VISIT) == 0 &&
+                    (blk & MASK_ICON) != BLK_BOMBFLAG)
+                    StepSquare(g_xCur, g_yCur);
+            } else {
+                StepBlock(g_xCur, g_yCur);
+            }
+        } else {
+            g_xCur = -2;
+            g_yCur = -2;
+        }
+    }
+    DisplayButton(g_iButtonCur);
+}
+
+static void DoTimer(void)
+{
+    if (g_fTimer && g_cSec < 999) {
+        g_cSec++;
+        DisplayTime();
+        PlayTune(SOUND_TICK);
+    }
+}
+
+static void PauseGame(void)
+{
+    KillSound();
+    if ((g_fStatus & STATUS_PAUSE) == 0)
+        g_fOldTimer = g_fTimer;
+    if (g_fStatus & STATUS_PLAY)
+        g_fTimer = 0;
+    g_fStatus |= STATUS_PAUSE;
+}
+
+static void ResumeGame(void)
+{
+    if (g_fStatus & STATUS_PLAY)
+        g_fTimer = g_fOldTimer;
+    g_fStatus &= ~(DWORD)STATUS_PAUSE;
+}
+
+/*=====================================================================
+    the smiley button - it runs its own little modal loop, as in the
+    original, so that the rest of the window proc never sees the drag
+  =====================================================================*/
+static BOOL FButtonHit(LPARAM lParam)
+{
+    RECT  rc;
+    MSG   msg;
+    POINT pt;
+    BOOL  fIn = TRUE;
+
+    pt.x = GET_X_LPARAM(lParam);
+    pt.y = GET_Y_LPARAM(lParam);
+
+    rc.left   = (g_dxClient - DX_BUTTON) >> 1;
+    rc.right  = rc.left + DX_BUTTON;
+    rc.top    = Y_BUTTON;
+    rc.bottom = Y_BUTTON + DY_BUTTON;
+
+    if (!PtInRect(&rc, pt))
+        return FALSE;
+
+    SetCapture(g_hwnd);
+    DisplayButton(FACE_DOWN);
+    MapWindowPoints(g_hwnd, NULL, (LPPOINT)&rc, 2);
+
+    for (;;) {
+        if (!PeekMessageW(&msg, g_hwnd, 0x0200, 0x020D, PM_REMOVE))
+            continue;
+
+        if (msg.message == WM_MOUSEMOVE) {
+            BOOL f = PtInRect(&rc, msg.pt) ? TRUE : FALSE;
+            if (f != fIn) {
+                fIn = f;
+                DisplayButton(f ? FACE_DOWN : g_iButtonCur);
+            }
+        } else if (msg.message == WM_LBUTTONUP) {
+            if (fIn && PtInRect(&rc, msg.pt)) {
+                g_iButtonCur = FACE_HAPPY;
+                DisplayButton(FACE_HAPPY);
+                StartGame();
+            }
+            break;
+        }
+    }
+    ReleaseCapture();
+    return TRUE;
+}
+
+/*=====================================================================
+    dialogs
+  =====================================================================*/
+static const DWORD c_rgdwHelpPref[] = {
+    ID_PREF_HEIGHT, 1000, ID_PREF_WIDTH, 1001, ID_PREF_MINE,      1002,
+    112,            1000, 113,           1001, ID_PREF_MINETEXT,  1002,
+    0, 0
+};
+static const DWORD c_rgdwHelpBest[] = {
+    ID_BEST_RESET, 1003, ID_BEST_LBL1,  1004, ID_BEST_LBL2, 1004,
+    ID_BEST_LBL3,  1004, ID_BEST_TIME1, 1004, ID_BEST_TIME2, 1004,
+    ID_BEST_TIME3, 1004, ID_BEST_NAME1, 1004, ID_BEST_NAME2, 1004,
+    ID_BEST_NAME3, 1004, 0, 0
+};
+
+static UINT GetDlgInt(HWND hDlg, int id, UINT lo, UINT hi)
+{
+    BOOL fOk;
+    UINT v = GetDlgItemInt(hDlg, id, &fOk, FALSE);
+
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+static INT_PTR CALLBACK PrefDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
+                                    LPARAM lParam)
+{
+    switch (msg) {
+    case WM_HELP:
+        WinHelpW(((LPHELPINFO)lParam)->hItemHandle
+                     ? (HWND)((LPHELPINFO)lParam)->hItemHandle : hDlg,
+                 L"winmine.hlp", HELP_WM_HELP, (ULONG_PTR)c_rgdwHelpPref);
+        return FALSE;
+
+    case WM_CONTEXTMENU:
+        WinHelpW((HWND)wParam, L"winmine.hlp", HELP_CONTEXTMENU,
+                 (ULONG_PTR)c_rgdwHelpPref);
+        return FALSE;
+
+    case WM_INITDIALOG:
+        SetDlgItemInt(hDlg, ID_PREF_HEIGHT, (UINT)g_cRowCfg, FALSE);
+        SetDlgItemInt(hDlg, ID_PREF_WIDTH,  (UINT)g_cBlkCfg, FALSE);
+        SetDlgItemInt(hDlg, ID_PREF_MINE,   (UINT)g_cMines,  FALSE);
+        return TRUE;
+
+    case WM_COMMAND:
+        switch (LOWORD(wParam)) {
+        case IDOK: {
+            UINT cMax;
+            g_cRowCfg = (int)GetDlgInt(hDlg, ID_PREF_HEIGHT, 9, 24);
+            g_cBlkCfg = (int)GetDlgInt(hDlg, ID_PREF_WIDTH,  9, 30);
+            cMax = (UINT)((g_cBlkCfg - 1) * (g_cRowCfg - 1));
+            if (cMax > 999)
+                cMax = 999;
+            g_cMines = (int)GetDlgInt(hDlg, ID_PREF_MINE, 10, cMax);
+            EndDialog(hDlg, TRUE);
+            return TRUE;
+        }
+        case IDCANCEL:
+            EndDialog(hDlg, TRUE);
+            return TRUE;
+        }
+        return FALSE;
+    }
+    return FALSE;
+}
+
+static void SetBestField(HWND hDlg, int idTime, int cSec, LPCWSTR szName)
+{
+    WCHAR sz[64];
+    wsprintfW(sz, g_szSeconds, cSec);
+    SetDlgItemTextW(hDlg, idTime, sz);
+    SetDlgItemTextW(hDlg, idTime + 1, szName);
+}
+
+static INT_PTR CALLBACK BestDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
+                                    LPARAM lParam)
+{
+    switch (msg) {
+    case WM_HELP:
+        WinHelpW(((LPHELPINFO)lParam)->hItemHandle
+                     ? (HWND)((LPHELPINFO)lParam)->hItemHandle : hDlg,
+                 L"winmine.hlp", HELP_WM_HELP, (ULONG_PTR)c_rgdwHelpBest);
+        return FALSE;
+
+    case WM_CONTEXTMENU:
+        WinHelpW((HWND)wParam, L"winmine.hlp", HELP_CONTEXTMENU,
+                 (ULONG_PTR)c_rgdwHelpBest);
+        return FALSE;
+
+    case WM_INITDIALOG:
+        break;
+
+    case WM_COMMAND:
+        switch (LOWORD(wParam)) {
+        case IDOK:
+        case IDCANCEL:
+            EndDialog(hDlg, TRUE);
+            return TRUE;
+        case ID_BEST_RESET:
+            g_rgTime[0] = g_rgTime[1] = g_rgTime[2] = 999;
+            lstrcpyW(g_rgszName[0], g_szAnonymous);
+            lstrcpyW(g_rgszName[1], g_szAnonymous);
+            lstrcpyW(g_rgszName[2], g_szAnonymous);
+            g_fUpdateReg = 1;
+            break;
+        default:
+            return FALSE;
+        }
+        break;
+
+    default:
+        return FALSE;
+    }
+
+    SetBestField(hDlg, ID_BEST_TIME1, g_rgTime[0], g_rgszName[0]);
+    SetBestField(hDlg, ID_BEST_TIME2, g_rgTime[1], g_rgszName[1]);
+    SetBestField(hDlg, ID_BEST_TIME3, g_rgTime[2], g_rgszName[2]);
+    return TRUE;
+}
+
+static INT_PTR CALLBACK EnterDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
+                                     LPARAM lParam)
+{
+    WCHAR sz[256];
+
+    (void)lParam;
+
+    switch (msg) {
+    case WM_INITDIALOG:
+        LoadSz((UINT)(IDS_BEST_BEGIN + g_wGameType), sz, 256);
+        SetDlgItemTextW(hDlg, ID_ENTER_PROMPT, sz);
+        SendMessageW(GetDlgItem(hDlg, ID_ENTER_NAME), EM_LIMITTEXT, 32, 0);
+        SetDlgItemTextW(hDlg, ID_ENTER_NAME, g_rgszName[g_wGameType]);
+        return TRUE;
+
+    case WM_COMMAND:
+        if (LOWORD(wParam) == 0)
+            return FALSE;
+        if (LOWORD(wParam) > 2 && LOWORD(wParam) != 100 &&
+            LOWORD(wParam) != 0x6D)
+            return FALSE;
+        GetDlgItemTextW(hDlg, ID_ENTER_NAME, g_rgszName[g_wGameType], 32);
+        EndDialog(hDlg, TRUE);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static void DoPref(void)
+{
+    DialogBoxParamW(g_hInst, MAKEINTRESOURCEW(DLG_PREF), g_hwnd,
+                    PrefDlgProc, 0);
+    g_wGameType = LEVEL_CUSTOM;
+    FixMenus();
+    g_fUpdateReg = 1;
+    StartGame();
+}
+
+static void DoEnterName(void)
+{
+    DialogBoxParamW(g_hInst, MAKEINTRESOURCEW(DLG_ENTER), g_hwnd,
+                    EnterDlgProc, 0);
+    g_fUpdateReg = 1;
+}
+
+static void DoBestTimes(void)
+{
+    DialogBoxParamW(g_hInst, MAKEINTRESOURCEW(DLG_BEST), g_hwnd,
+                    BestDlgProc, 0);
+}
+
+static void DoAbout(void)
+{
+    WCHAR szName[128], szAuthor[128];
+    HICON hIcon;
+
+    LoadSz(IDS_ABOUT_NAME,   szName,   128);
+    LoadSz(IDS_ABOUT_AUTHOR, szAuthor, 128);
+    hIcon = LoadIconW(g_hInst, MAKEINTRESOURCEW(ID_ICON_MAIN));
+    ShellAboutW(g_hwnd, szName, szAuthor, hIcon);
+}
+
+/* HtmlHelp, loaded on demand - there is no .chm shipped with this */
+static void DoHelp(int iTopic, DWORD dwCmd)
+{
+    typedef HWND (WINAPI *PFNHH)(HWND, LPCSTR, UINT, DWORD_PTR);
+    char  szPath[MAX_PATH];
+    DWORD cch;
+
+    if (iTopic == 4) {
+        lstrcpyA(szPath, "NTHelp.chm");
+    } else {
+        cch = GetModuleFileNameA(g_hInst, szPath, MAX_PATH - 8);
+        if (cch == 0)
+            return;
+        if (cch > 4 && szPath[cch - 4] == '.')
+            cch -= 4;
+        lstrcpyA(szPath + cch, ".chm");
+    }
+
+    if (g_hmodHelp == NULL) {
+        if (g_fHelpFailed)
+            return;
+        g_hmodHelp = LoadLibraryA("hhctrl.ocx");
+        if (g_hmodHelp == NULL) {
+            g_fHelpFailed = 1;
+            return;
+        }
+    }
+    if (g_pfnHtmlHelp == NULL) {
+        g_pfnHtmlHelp = GetProcAddress(g_hmodHelp, (LPCSTR)14); /* HtmlHelpA */
+        if (g_pfnHtmlHelp == NULL) {
+            g_fHelpFailed = 1;
+            return;
+        }
+    }
+    ((PFNHH)(void *)g_pfnHtmlHelp)(GetDesktopWindow(), szPath, (UINT)dwCmd, 0);
+}
+
+/*=====================================================================
+    the window procedure
+  =====================================================================*/
+static const WCHAR c_szXyzzy[] = L"XYZZY";
+
+/* client pixel -> cell index */
+#define XFromLp(lp)  ((GET_X_LPARAM(lp) + 4) >> 4)
+#define YFromLp(lp)  ((GET_Y_LPARAM(lp) - 0x27) >> 4)
+
+static void StartTracking(HWND hwnd, LPARAM lParam)
+{
+    SetCapture(hwnd);
+    g_xCur = -1;
+    g_yCur = -1;
+    g_fBlockTrack = 1;
+    DisplayButton(FACE_CAUTION);
+    TrackMouse(XFromLp(lParam), YFromLp(lParam));
+}
+
+static void ReleaseTracking(void)
+{
+    g_fBlockTrack = 0;
+    ReleaseCapture();
+    if (g_fStatus & STATUS_PLAY)
+        DoButton1Up();
+    else
+        TrackMouse(-2, -2);
+}
+
+/*---------------------------------------------------------------------
+    The XYZZY cheat.  Typing X-Y-Z-Z-Y advances g_iXyzzy to 5; pressing
+    SHIFT then flips it to 17 (5 ^ 0x14), which arms it - pressing SHIFT
+    again disarms it.  While it is armed (or while it sits at 5 and CTRL
+    is held down) every mouse move over the field pokes the single pixel
+    in the top-left corner of the *screen*: black when the cell under the
+    cursor hides a mine, white when it does not.
+  -------------------------------------------------------------------*/
+static void DoXyzzy(WPARAM wParam, LPARAM lParam)
+{
+    HDC hdc;
+
+    if (g_iXyzzy < 5)
+        return;
+    if (g_iXyzzy == 5 && (wParam & MK_CONTROL) == 0)
+        return;
+
+    g_xCur = XFromLp(lParam);
+    g_yCur = YFromLp(lParam);
+    if (g_xCur < 1 || g_yCur < 1 || g_xCur > g_cBlk || g_yCur > g_cRow)
+        return;
+
+    hdc = GetDC(NULL);
+    SetPixel(hdc, 0, 0, (*PblkAt(g_xCur, g_yCur) & MASK_BOMB)
+                        ? RGB(0, 0, 0) : RGB(255, 255, 255));
+    ReleaseDC(NULL, hdc);
+}
+
+static LRESULT CALLBACK MineWndProc(HWND hwnd, UINT msg, WPARAM wParam,
+                                    LPARAM lParam)
+{
+    switch (msg) {
+
+    case WM_DESTROY:
+        KillTimer(g_hwnd, ID_TIMER);
+        PostQuitMessage(0);
+        break;
+
+    case WM_ACTIVATE:
+        if (wParam == WA_CLICKACTIVE)
+            g_fIgnoreClick = 1;
+        break;
+
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+        DrawScreen(hdc);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+
+    case WM_MOVE:
+        if ((g_fStatus & STATUS_ICON) == 0) {
+            g_xWindow = GET_X_LPARAM(lParam);
+            g_yWindow = GET_Y_LPARAM(lParam);
+        }
+        break;
+
+    case WM_TIMER:
+        DoTimer();
+        return 0;
+
+    case WM_ENTERMENULOOP:
+        g_fInMenu = 1;
+        break;
+
+    case WM_EXITMENULOOP:
+        g_fInMenu = 0;
+        break;
+
+    case WM_SYSCOMMAND:
+        if ((wParam & 0xFFF0) == SC_MINIMIZE) {
+            PauseGame();
+            g_fStatus |= (STATUS_PAUSE | STATUS_ICON);
+        } else if ((wParam & 0xFFF0) == SC_RESTORE) {
+            g_fStatus &= ~(DWORD)(STATUS_PAUSE | STATUS_ICON);
+            ResumeGame();
+            g_fIgnoreClick = 0;
+        }
+        break;
+
+    case WM_KEYDOWN:
+        switch (wParam) {
+        case VK_SHIFT:
+            if (g_iXyzzy > 4)
+                g_iXyzzy ^= 0x14;
+            break;
+
+        case VK_F4:
+            if (g_fSound > 1) {
+                if (g_fSound == 3) {
+                    KillSound();
+                    g_fSound = 2;
+                } else {
+                    g_fSound = FTestSound();
+                }
+            }
+            break;
+
+        case VK_F5:
+            if (g_fMenu != 0)
+                SetMenuBar(1);
+            break;
+
+        case VK_F6:
+            if (g_fMenu != 0)
+                SetMenuBar(2);
+            break;
+
+        default:
+            if (g_iXyzzy < 5)
+                g_iXyzzy = (c_szXyzzy[g_iXyzzy] == (WCHAR)wParam)
+                           ? g_iXyzzy + 1 : 0;
+            break;
+        }
+        break;
+
+    case WM_COMMAND:
+        switch (LOWORD(wParam)) {
+        case IDM_NEW:
+            StartGame();
+            break;
+
+        case IDM_EXIT:
+            ShowWindow(g_hwnd, SW_HIDE);
+            SendMessageW(g_hwnd, WM_SYSCOMMAND, SC_CLOSE, 0);
+            return 0;
+
+        case IDM_BEGIN:
+        case IDM_INTER:
+        case IDM_EXPERT:
+            g_wGameType = (int)LOWORD(wParam) - IDM_BEGIN;
+            g_cMines    = c_rgPreset[g_wGameType][0];
+            g_cRowCfg   = c_rgPreset[g_wGameType][1];
+            g_cBlkCfg   = c_rgPreset[g_wGameType][2];
+            StartGame();
+            g_fUpdateReg = 1;
+            SetMenuBar((UINT)g_fMenu);
+            break;
+
+        case IDM_CUSTOM:
+            DoPref();
+            break;
+
+        case IDM_SOUND:
+            if (g_fSound == 0) {
+                g_fSound = FTestSound();
+            } else {
+                KillSound();
+                g_fSound = 0;
+            }
+            g_fUpdateReg = 1;
+            SetMenuBar((UINT)g_fMenu);
+            break;
+
+        case IDM_MARK:
+            g_fMark = !g_fMark;
+            g_fUpdateReg = 1;
+            SetMenuBar((UINT)g_fMenu);
+            break;
+
+        case IDM_COLOR:
+            g_fColor = !g_fColor;
+            FreeBmp();
+            if (!FLoadBmp()) {
+                ReportErr(IDS_ERR_MEMORY);
+                ShowWindow(g_hwnd, SW_HIDE);
+                SendMessageW(g_hwnd, WM_SYSCOMMAND, SC_CLOSE, 0);
+                return 0;
+            }
+            DisplayScreen();
+            g_fUpdateReg = 1;
+            SetMenuBar((UINT)g_fMenu);
+            break;
+
+        case IDM_BEST:
+            DoBestTimes();
+            break;
+
+        case IDM_HELP:        DoHelp(3, 0); break;
+        case IDM_HELP_SEARCH: DoHelp(1, 2); break;
+        case IDM_HELP_USING:  DoHelp(4, 0); break;
+
+        case IDM_ABOUT:
+            DoAbout();
+            return 0;
+        }
+        break;
+
+    /*--------------------------------------------------------------*/
+    case WM_LBUTTONDOWN:
+        if (g_fIgnoreClick) { g_fIgnoreClick = 0; return 0; }
+        if (FButtonHit(lParam))             return 0;
+        if ((g_fStatus & STATUS_PLAY) == 0) break;
+        g_fChord = ((wParam & (MK_RBUTTON | MK_SHIFT)) != 0);
+        StartTracking(hwnd, lParam);
+        return 0;
+
+    case WM_MBUTTONDOWN:
+        if (g_fIgnoreClick) { g_fIgnoreClick = 0; return 0; }
+        if ((g_fStatus & STATUS_PLAY) == 0) break;
+        g_fChord = 1;
+        StartTracking(hwnd, lParam);
+        return 0;
+
+    case WM_RBUTTONDOWN:
+        if (g_fIgnoreClick) { g_fIgnoreClick = 0; return 0; }
+        if ((g_fStatus & STATUS_PLAY) == 0) break;
+        if (g_fBlockTrack) {
+            TrackMouse(-3, -3);
+            g_fChord = 1;
+            PostMessageW(g_hwnd, WM_MOUSEMOVE, wParam, lParam);
+            return 0;
+        }
+        if ((wParam & MK_LBUTTON) == 0) {
+            if (!g_fInMenu)
+                MarkSquare(XFromLp(lParam), YFromLp(lParam));
+            return 0;
+        }
+        StartTracking(hwnd, lParam);
+        return 0;
+
+    case WM_LBUTTONUP:
+    case WM_RBUTTONUP:
+    case WM_MBUTTONUP:
+        if (g_fBlockTrack)
+            ReleaseTracking();
+        break;
+
+    case WM_MOUSEMOVE:
+        if (g_fBlockTrack) {
+            if ((g_fStatus & STATUS_PLAY) == 0)
+                ReleaseTracking();
+            else
+                TrackMouse(XFromLp(lParam), YFromLp(lParam));
+            break;
+        }
+        if (g_iXyzzy != 0)
+            DoXyzzy(wParam, lParam);
+        break;
+    }
+
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+/*=====================================================================
+    entry point
+  =====================================================================*/
+static int RunApp(HINSTANCE hInst, int nCmdShow)
+{
+    WNDCLASSW wc;
+    MSG       msg;
+    HACCEL    hAccel;
+    INITCOMMONCONTROLSEX icc;
+    RECT      rc;
+
+    g_hInst = hInst;
+    InitPreferences();
+
+    g_fFrozen = (nCmdShow == SW_SHOWMINIMIZED ||
+                 nCmdShow == SW_SHOWMINNOACTIVE);
+
+    icc.dwSize = sizeof(icc);
+    icc.dwICC  = 0x000016FD;        /* every ICC_ class we might use */
+    InitCommonControlsEx(&icc);
+
+    wc.style         = 0;
+    wc.lpfnWndProc   = MineWndProc;
+    wc.cbClsExtra    = 0;
+    wc.cbWndExtra    = 0;
+    wc.hInstance     = g_hInst;
+    wc.hIcon         = LoadIconW(g_hInst, MAKEINTRESOURCEW(ID_ICON_MAIN));
+    wc.hCursor       = LoadCursorW(NULL, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)GetStockObject(LTGRAY_BRUSH);
+    wc.lpszMenuName  = NULL;
+    wc.lpszClassName = g_szClass;
+
+    if (!RegisterClassW(&wc))
+        return 0;
+
+    g_hMenu = LoadMenuW(g_hInst, MAKEINTRESOURCEW(ID_MENU));
+    hAccel  = LoadAcceleratorsW(g_hInst, MAKEINTRESOURCEW(ID_ACCEL));
+
+    ReadPreferences();
+
+    g_dxClient = g_cBlk * DX_BLK + DX_WINDOW;
+    g_dyClient = g_cRow * DY_BLK + DY_WINDOW;
+
+    SetRect(&rc, 0, 0, g_dxClient, g_dyClient);
+    AdjustWindowRect(&rc, WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+                     (g_fMenu & 1) == 0);
+
+    g_hwnd = CreateWindowExW(0, g_szClass, g_szClass,
+                             WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+                             g_xWindow + rc.left, g_yWindow + rc.top,
+                             rc.right - rc.left, rc.bottom - rc.top,
+                             NULL, NULL, g_hInst, NULL);
+    if (g_hwnd == NULL) {
+        ReportErr(1000);
+        return 0;
+    }
+
+    if (!FLoadBmp()) {
+        ReportErr(IDS_ERR_MEMORY);
+        return 0;
+    }
+
+    SetMenuBar((UINT)g_fMenu);
+    StartGame();
+
+    ShowWindow(g_hwnd, SW_SHOWNORMAL);
+    UpdateWindow(g_hwnd);
+    g_fFrozen = 0;
+
+    while (GetMessageW(&msg, NULL, 0, 0)) {
+        if (!TranslateAcceleratorW(g_hwnd, hAccel, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+
+    FreeBmp();
+    KillSound();
+    if (g_fUpdateReg)
+        WritePreferences();
+
+    return (int)msg.wParam;
+}
+
+/* nCmdShow the way the loader passed it, without the C runtime's help */
+static int RunFromStartupInfo(void)
+{
+    STARTUPINFOW si;
+    int nCmdShow = SW_SHOWNORMAL;
+
+    GetStartupInfoW(&si);
+    if (si.dwFlags & STARTF_USESHOWWINDOW)
+        nCmdShow = si.wShowWindow;
+
+    return RunApp(GetModuleHandleW(NULL), nCmdShow);
+}
+
+/*---------------------------------------------------------------------
+    Three ways in, so the same source builds under any of the link
+    models build.cmd uses:
+
+      MinerEntry  the raw PE entry point, used when the program is
+                  linked with -nostartfiles / -nodefaultlibs.  Nothing
+                  here needs the C run-time's start-up code: every
+                  global is constant- or zero-initialised, and the two
+                  library routines used (memset, rand) are defined in
+                  this file.
+      WinMain     the MSVC / -mwindows entry.
+      main        mingw's default entry (compiled out when MINER_NO_CRT
+                  is defined, because gcc makes main() call __main(),
+                  which drags the whole start-up machinery back in).
+  -------------------------------------------------------------------*/
+extern "C" void MinerEntry(void)
+{
+    ExitProcess((UINT)RunFromStartupInfo());
+}
+
+int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine,
+                   int nCmdShow)
+{
+    (void)hPrev; (void)lpCmdLine;
+    return RunApp(hInst, nCmdShow);
+}
+
+#ifndef MINER_NO_CRT
+int main(void)
+{
+    return RunFromStartupInfo();
+}
+#endif

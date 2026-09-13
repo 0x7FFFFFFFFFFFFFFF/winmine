@@ -1,0 +1,162 @@
+/* miner.rc - menu, dialogs, strings, artwork and sounds */
+#include <windows.h>
+#include "resource.h"
+
+/* ------------------------------------------------------------------ */
+/* icon                                                                */
+/* ------------------------------------------------------------------ */
+ID_ICON_MAIN            ICON    "../res/miner.ico"
+
+/* ------------------------------------------------------------------ */
+/* bitmaps                                                             */
+/* ------------------------------------------------------------------ */
+ID_BMP_BLOCKS           BITMAP  "../res/blk410.bmp"
+ID_BMP_BLOCKS_MONO      BITMAP  "../res/blk411.bmp"
+ID_BMP_LED              BITMAP  "../res/blk420.bmp"
+ID_BMP_LED_MONO         BITMAP  "../res/blk421.bmp"
+ID_BMP_FACE             BITMAP  "../res/blk430.bmp"
+ID_BMP_FACE_MONO        BITMAP  "../res/blk431.bmp"
+
+/* ------------------------------------------------------------------ */
+/* sounds                                                              */
+/* ------------------------------------------------------------------ */
+ID_WAV_TICK             WAVE    "../res/tick.wav"
+ID_WAV_WIN              WAVE    "../res/win.wav"
+ID_WAV_LOSE             WAVE    "../res/lose.wav"
+
+/* ------------------------------------------------------------------ */
+/* menu                                                                */
+/* ------------------------------------------------------------------ */
+ID_MENU MENU
+BEGIN
+    POPUP "&Game"
+    BEGIN
+        MENUITEM "&New\tF2",            IDM_NEW
+        MENUITEM SEPARATOR
+        MENUITEM "&Beginner",           IDM_BEGIN
+        MENUITEM "&Intermediate",       IDM_INTER
+        MENUITEM "&Expert",             IDM_EXPERT
+        MENUITEM "&Custom...",          IDM_CUSTOM
+        MENUITEM SEPARATOR
+        MENUITEM "&Marks (?)",          IDM_MARK
+        MENUITEM "Co&lor",              IDM_COLOR
+        MENUITEM "&Sound",              IDM_SOUND
+        MENUITEM SEPARATOR
+        MENUITEM "Best &Times...",      IDM_BEST
+        MENUITEM SEPARATOR
+        MENUITEM "E&xit",               IDM_EXIT
+    END
+    POPUP "&Help"
+    BEGIN
+        MENUITEM "&Contents\tF1",           IDM_HELP
+        MENUITEM "&Search for Help on...",  IDM_HELP_SEARCH
+        MENUITEM "Using &Help",             IDM_HELP_USING
+        MENUITEM SEPARATOR
+        MENUITEM "&About Minesweeper...",   IDM_ABOUT
+    END
+END
+
+/* ------------------------------------------------------------------ */
+/* accelerators                                                        */
+/* ------------------------------------------------------------------ */
+ID_ACCEL ACCELERATORS
+BEGIN
+    VK_F1,  IDM_HELP,   VIRTKEY
+    VK_F2,  IDM_NEW,    VIRTKEY
+END
+
+/* ------------------------------------------------------------------ */
+/* dialogs                                                             */
+/* ------------------------------------------------------------------ */
+DLG_PREF DIALOG 0, 0, 130, 85
+STYLE DS_MODALFRAME | DS_3DLOOK | DS_SETFONT | WS_POPUP | WS_VISIBLE | WS_CAPTION | WS_SYSMENU
+CAPTION "Custom Field"
+FONT 8, "MS Shell Dlg"
+BEGIN
+    DEFPUSHBUTTON   "OK",       IDOK,               80, 20, 40, 16
+    PUSHBUTTON      "Cancel",   IDCANCEL,           80, 46, 40, 16
+    LTEXT           "&Height:", ID_PREF_HEIGHTTEXT, 10, 22, 25, 10
+    EDITTEXT                    ID_PREF_HEIGHT,     40, 20, 25, 12, ES_AUTOHSCROLL
+    LTEXT           "&Width:",  ID_PREF_WIDTHTEXT,  10, 37, 25, 10
+    EDITTEXT                    ID_PREF_WIDTH,      40, 35, 25, 12, ES_AUTOHSCROLL
+    LTEXT           "&Mines:",  ID_PREF_MINETEXT,   10, 52, 25, 10
+    EDITTEXT                    ID_PREF_MINE,       40, 50, 25, 12, ES_AUTOHSCROLL
+END
+
+DLG_ENTER DIALOG 0, 28, 100, 100
+STYLE DS_MODALFRAME | DS_SETFONT | WS_POPUP | WS_VISIBLE
+FONT 8, "MS Shell Dlg"
+BEGIN
+    EDITTEXT                ID_ENTER_NAME,   12, 51, 78, 12, ES_AUTOHSCROLL | WS_GROUP
+    DEFPUSHBUTTON   "OK",   IDOK,            32, 71, 36, 16
+    CTEXT           "",     ID_ENTER_PROMPT,  4,  4, 88, 43
+END
+
+DLG_BEST DIALOG 0, 28, 170, 75
+STYLE DS_MODALFRAME | DS_3DLOOK | DS_SETFONT | WS_POPUP | WS_VISIBLE | WS_CAPTION | WS_SYSMENU
+CAPTION "Fastest Mine Sweepers"
+FONT 8, "MS Shell Dlg"
+BEGIN
+    DEFPUSHBUTTON   "OK",               IDOK,           115, 55, 30, 12
+    PUSHBUTTON      "&Reset Scores",    ID_BEST_RESET,   25, 55, 50, 12
+    LTEXT           "Beginner:",        ID_BEST_LBL1,    10, 15, 48,  8
+    LTEXT           "",                 ID_BEST_TIME1,   60, 15, 44,  8
+    LTEXT           "",                 ID_BEST_NAME1,  115, 15, 60,  8
+    LTEXT           "Intermediate:",    ID_BEST_LBL2,    10, 25, 48,  8
+    LTEXT           "",                 ID_BEST_TIME2,   60, 25, 44,  8
+    LTEXT           "",                 ID_BEST_NAME2,  115, 25, 60,  8
+    LTEXT           "Expert:",          ID_BEST_LBL3,    10, 35, 48,  8
+    LTEXT           "",                 ID_BEST_TIME3,   60, 35, 44,  8
+    LTEXT           "",                 ID_BEST_NAME3,  115, 35, 60,  8
+END
+
+/* ------------------------------------------------------------------ */
+/* strings                                                             */
+/* ------------------------------------------------------------------ */
+STRINGTABLE
+BEGIN
+    IDS_NAME            "Minesweeper"
+    IDS_ERR_TITLE       "Minesweeper Error"
+    IDS_ERR_TIMER       "Unable to allocate a timer.  Please exit some of your applications and try again."
+    IDS_ERR_MEMORY      "Out of Memory"
+    IDS_ERR_UNKNOWN     "Error: %d"
+    IDS_SECONDS         "%d seconds"
+    IDS_ANONYMOUS       "Anonymous"
+    IDS_BEST_BEGIN      "You have the fastest time\rfor beginner level.\rPlease enter your name."
+    IDS_BEST_INTER      "You have the fastest time\rfor intermediate level.\rPlease enter your name."
+    IDS_BEST_EXPERT     "You have the fastest time\rfor expert level.\rPlease enter your name."
+    IDS_ABOUT_NAME      "Minesweeper"
+    IDS_ABOUT_AUTHOR    "by Robert Donner and Curt Johnson"
+END
+
+/* ------------------------------------------------------------------ */
+/* side-by-side manifest (enables the v6 common controls look)         */
+/* ------------------------------------------------------------------ */
+1 RT_MANIFEST "miner.manifest"
+
+/* ------------------------------------------------------------------ */
+/* version                                                             */
+/* ------------------------------------------------------------------ */
+1 VERSIONINFO
+FILEVERSION     1,0,0,0
+PRODUCTVERSION  1,0,0,0
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_APP
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "FileDescription",  "Minesweeper"
+            VALUE "FileVersion",      "1.0.0.0"
+            VALUE "InternalName",     "winmine"
+            VALUE "OriginalFilename", "winmine.exe"
+            VALUE "ProductName",      "Minesweeper"
+            VALUE "ProductVersion",   "1.0.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
