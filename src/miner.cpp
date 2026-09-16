@@ -1686,10 +1686,21 @@ static void DoButton1Up(void)
         if (g_fStatus & STATUS_PLAY) {
             if (!g_fChord) {
                 BYTE blk = *PblkAt(g_xCur, g_yCur);
-                if (blk & MASK_VISIT)
+                if (blk & MASK_VISIT) {
+                    /* Clicking an uncovered number does both halves of
+                       the bookkeeping: flag the neighbours when they
+                       can only be mines, and open them when the flags
+                       already add up.  Only one of the two can apply -
+                       if the covered squares match the number they all
+                       get flagged and there is nothing left to open;
+                       if the flags match it, there is nothing left to
+                       flag. */
                     FlagSquare(g_xCur, g_yCur);
-                else if ((blk & MASK_ICON) != BLK_BOMBFLAG)
+                    if (g_fStatus & STATUS_PLAY)
+                        StepBlock(g_xCur, g_yCur);
+                } else if ((blk & MASK_ICON) != BLK_BOMBFLAG) {
                     StepSquare(g_xCur, g_yCur);
+                }
             } else {
                 StepBlock(g_xCur, g_yCur);
             }

@@ -136,8 +136,8 @@ ring of `0x10` sentinels so the neighbour loops never need edge tests:
 * chording (both buttons, middle button, or shift + left) only fires when the
   flag count around the cell equals its number, and pressing in shows the whole
   3×3 block;
-* left-clicking an uncovered number flags its neighbours when the squares still
-  covered around it number exactly what the square says — see below;
+* left-clicking an uncovered number flags or opens its neighbours, depending on
+  what already adds up — see below;
 * right-click cycles blank → flag → `?` → blank, and skips `?` when **Marks**
   is off; only the flag transitions move the mine counter;
 * placing the last flag when every safe cell is already open wins the game;
@@ -148,17 +148,27 @@ ring of `0x10` sentinels so the neighbour loops never need edge tests:
 
 F1 opens help, F2 starts a new game.
 
-### Auto-flagging
+### Clicking a number
 
-**Left-click an uncovered number** and, if the squares still covered around it
-number exactly what the square says, every one of them must be a mine — so they
-are all flagged in one go. Squares already carrying a flag count towards the
-total but are left as they are; question marks count too and become flags. If
-the count does not match, nothing happens.
+**Left-click an uncovered number** and it does whichever piece of bookkeeping
+has become obvious:
 
-It is the mirror image of chording: chording *opens* a number's neighbours once
-its flags add up, this *flags* them once its blanks add up. Clicking the same
-number again is a no-op, since there is nothing left to flag.
+* if the squares still **covered** around it number exactly what the square
+  says, every one of them must be a mine, so they are all **flagged** at once.
+  Squares already carrying a flag count towards the total but are left as they
+  are; question marks count too and become flags;
+* if its **flags** already number what the square says, the remaining unflagged
+  neighbours cannot be mines, so they are all **opened** — a flood fill from
+  each, exactly as chording does.
+
+Only one of the two can ever apply. If the covered squares match the number
+they all get flagged and there is nothing left to open; if the flags match it,
+there is nothing left to flag. When neither matches, the click does nothing at
+all, and clicking a square whose work is already done is a no-op.
+
+The opening half is the same operation as chording — and carries the same risk:
+if a flag is in the wrong place, opening its neighbours steps on a mine and
+ends the game, just as a chord would.
 
 ## Custom fields
 
