@@ -136,6 +136,8 @@ ring of `0x10` sentinels so the neighbour loops never need edge tests:
 * chording (both buttons, middle button, or shift + left) only fires when the
   flag count around the cell equals its number, and pressing in shows the whole
   3×3 block;
+* left-clicking an uncovered number flags its neighbours when the squares still
+  covered around it number exactly what the square says — see below;
 * right-click cycles blank → flag → `?` → blank, and skips `?` when **Marks**
   is off; only the flag transitions move the mine counter;
 * placing the last flag when every safe cell is already open wins the game;
@@ -145,6 +147,18 @@ ring of `0x10` sentinels so the neighbour loops never need edge tests:
 * minimising pauses the clock and restores it on the way back.
 
 F1 opens help, F2 starts a new game.
+
+### Auto-flagging
+
+**Left-click an uncovered number** and, if the squares still covered around it
+number exactly what the square says, every one of them must be a mine — so they
+are all flagged in one go. Squares already carrying a flag count towards the
+total but are left as they are; question marks count too and become flags. If
+the count does not match, nothing happens.
+
+It is the mirror image of chording: chording *opens* a number's neighbours once
+its flags add up, this *flags* them once its blanks add up. Clicking the same
+number again is a no-op, since there is nothing left to flag.
 
 ## Custom fields
 

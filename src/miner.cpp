@@ -1552,6 +1552,57 @@ static void MarkSquare(int x, int y)
 }
 
 /*---------------------------------------------------------------------
+    Click an uncovered number and, if the squares still covered around
+    it number exactly what the square says, every one of them has to be
+    a mine - so flag the ones that are not flagged already.  Squares
+    already carrying a flag count towards the total but are left alone;
+    question marks count too, and become flags.
+
+    This is the counterpart of chording: chording opens a number's
+    neighbours once its flags add up, this flags them once its blanks
+    add up.
+  -------------------------------------------------------------------*/
+static void FlagSquare(int x, int y)
+{
+    BYTE bTile = (BYTE)(*PblkAt(x, y) & MASK_ICON);
+    int  cCovered = 0;
+    int  cFlagged = 0;
+    int  i, j;
+
+    if ((*PblkAt(x, y) & MASK_VISIT) == 0)
+        return;
+    if (bTile < 1 || bTile > BLK_8)
+        return;
+
+    for (j = y - 1; j <= y + 1; j++) {
+        for (i = x - 1; i <= x + 1; i++) {
+            BYTE b = *PblkAt(i, j);
+            if ((b & MASK_VISIT) || (b & MASK_ICON) == BLK_BORDER)
+                continue;
+            cCovered++;
+        }
+    }
+    if (cCovered != (int)bTile)
+        return;
+
+    for (j = y - 1; j <= y + 1; j++) {
+        for (i = x - 1; i <= x + 1; i++) {
+            BYTE b = *PblkAt(i, j);
+            if ((b & MASK_VISIT) || (b & MASK_ICON) == BLK_BORDER)
+                continue;
+            if ((b & MASK_ICON) == BLK_BOMBFLAG)
+                continue;
+            UpdateBombCount(-1);
+            ChangeBlk(i, j, BLK_BOMBFLAG);
+            cFlagged++;
+        }
+    }
+
+    if (cFlagged && g_cBlkVisit == g_cBlkTotal)
+        GameOver(1);
+}
+
+/*---------------------------------------------------------------------
     mouse tracking: push in / pop out the cell (or the 3x3 block when
     chording) under the cursor
   -------------------------------------------------------------------*/
@@ -1635,8 +1686,9 @@ static void DoButton1Up(void)
         if (g_fStatus & STATUS_PLAY) {
             if (!g_fChord) {
                 BYTE blk = *PblkAt(g_xCur, g_yCur);
-                if ((blk & MASK_VISIT) == 0 &&
-                    (blk & MASK_ICON) != BLK_BOMBFLAG)
+                if (blk & MASK_VISIT)
+                    FlagSquare(g_xCur, g_yCur);
+                else if ((blk & MASK_ICON) != BLK_BOMBFLAG)
                     StepSquare(g_xCur, g_yCur);
             } else {
                 StepBlock(g_xCur, g_yCur);
