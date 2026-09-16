@@ -81,6 +81,7 @@ BEGIN
     EDITTEXT                    ID_PREF_WIDTH,      40, 35, 25, 12, ES_AUTOHSCROLL
     LTEXT           "&Mines:",  ID_PREF_MINETEXT,   10, 52, 25, 10
     EDITTEXT                    ID_PREF_MINE,       40, 50, 25, 12, ES_AUTOHSCROLL
+    PUSHBUTTON      "&Random",  ID_PREF_RANDOM,     10, 66, 110, 14
 END
 
 DLG_ENTER DIALOG 0, 28, 100, 100

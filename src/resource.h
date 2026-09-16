@@ -50,6 +50,7 @@
 #define ID_PREF_HEIGHT      141
 #define ID_PREF_WIDTH       142
 #define ID_PREF_MINE        143
+#define ID_PREF_RANDOM      144
 
 /* Enter-name controls */
 #define ID_ENTER_PROMPT     601

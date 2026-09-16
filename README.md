@@ -1,8 +1,8 @@
 # Minesweeper
 
-A C++/Win32 Minesweeper: three preset levels plus a custom field, question
-marks, chording, a clock, best times, sound, a monochrome mode — and the
-XYZZY peek.
+A C++/Win32 Minesweeper: three preset levels plus a custom field of any
+size, question marks, chording, a clock, best times, sound, a monochrome
+mode, zoom, window panning — and two hidden peeks.
 
 ![Expert board part way through a game](docs/expert.png)
 
@@ -28,11 +28,31 @@ produces `winmine.exe` next to `build.cmd`.
 | `build.cmd` | builds `winmine.exe` |
 | `src/miner.cpp` | the whole game, one translation unit |
 | `src/miner.rc`, `src/resource.h` | menu, dialogs, strings, accelerators, version |
-| `src/miner.manifest` | side-by-side manifest for the v6 common controls |
+| `src/miner.manifest` | v6 common controls, and the DPI-aware flag |
 | `res/*.bmp`, `res/miner.ico`, `res/*.wav` | artwork and sounds |
 | `build/` | intermediate object/resource files |
 | `docs/` | the screenshots above |
 | `LICENSE` | WTFPL |
+
+## Zoom and panning
+
+**Ctrl + mouse wheel** zooms the whole interface, 25% to 400% in 25%
+steps — wheel up to magnify, wheel down to shrink. Everything scales
+together: the artwork, the LED digits and the one-pixel 3D edges. The
+interface is composed once at 1:1 onto an offscreen surface and then
+stretched to the window with nearest-neighbour sampling, so magnifying
+gives clean, hard-edged pixels rather than a blurred interpolation.
+
+**Hold Space and drag with the left button** to slide the window around
+from anywhere in the playfield, like the hand tool in an image editor.
+The cursor changes while Space is held, and dragging never disturbs the
+game underneath. This is what makes very large fields usable: zoom out
+for an overview, then pan to reach the far corners.
+
+The program is marked DPI-aware, so one game pixel is one screen pixel.
+On a high-DPI display that makes the window small but perfectly sharp —
+zoom is what makes it bigger, rather than letting Windows stretch and
+blur it.
 
 ## Settings and scores
 
@@ -85,9 +105,8 @@ grey (black, in mono) pen with `R2_COPYPEN` for the shadow.
 
 ## Board encoding
 
-One byte per cell in a fixed 864-byte array with a stride of 32 bytes — which
-is what caps the width at 30 — surrounded by a ring of `0x10` sentinels so the
-neighbour loops never need edge tests:
+One byte per cell, in an array allocated to fit the field and surrounded by a
+ring of `0x10` sentinels so the neighbour loops never need edge tests:
 
 ```
 0x80  a mine is here
@@ -101,7 +120,8 @@ neighbour loops never need edge tests:
 
 * the first cell uncovered is never a mine — if it is, the mine is relocated to
   the first free square found scanning rows/columns `1 .. n-1`;
-* uncovering is a flood fill through a 100-entry ring buffer, not recursion;
+* uncovering is a flood fill through a ring buffer, not recursion; the ring
+  holds one entry per square, so it cannot lap itself and lose a pending one;
 * chording (both buttons, middle button, or shift + left) only fires when the
   flag count around the cell equals its number, and pressing in shows the whole
   3×3 block;
@@ -114,6 +134,30 @@ neighbour loops never need edge tests:
 * minimising pauses the clock and restores it on the way back.
 
 F1 opens help, F2 starts a new game.
+
+## Custom fields
+
+**Game ▸ Custom** takes any height, width and mine count you type — there
+is no upper limit in the dialog. The board, the flood-fill queue and the
+offscreen surface are all allocated to fit, and a field too large for the
+machine is refused with an out-of-memory message, leaving the game you
+were playing untouched. In practice that ceiling is around 250,000
+squares (a 500 × 500 field).
+
+Two details fall out of large fields:
+
+* the mine counter grows a digit at a time past 999, so the reading stays
+  honest — at 999 or fewer it is the classic three-digit readout;
+* mines are placed by picking squares at random, but once more than half
+  the field is mined the program mines everything and picks the *gaps*
+  instead, so placement stays fast at any density.
+
+**Random** fills the dialog with a field between 50 × 50 and 200 × 200
+and a matching mine count. The presets run 12% (beginner), 16%
+(intermediate) and 21% (expert), so density climbs with size; the button
+continues that line, scaling from 16% at 2,500 squares to 21% at 40,000
+and holding there, with ±5% jitter so two presses do not give the same
+game.
 
 ## The XYZZY peek
 
@@ -134,10 +178,22 @@ screen changes, which is what makes it discreet.
 Because the pixel is painted directly on the screen, it is erased again by the
 next thing that repaints that corner.
 
+## The Ctrl+T peek
+
+**Ctrl + T** toggles a second, less coy cheat. While it is on, the four
+pixels in the very bottom-left corner of the window answer the same
+question XYZZY does about the square under the cursor: **red** for a
+mine, **green** for clear. Press Ctrl + T again to turn it off and the
+corner goes back to normal.
+
+The block is painted straight onto the window in device pixels rather
+than onto the zoomed surface, so it stays a 2 × 2 square of real screen
+pixels no matter how far the interface is zoomed in.
+
 ## Building
 
-`build.cmd` holds `winmine.exe` to a **119,808 byte budget** and fails the
-build if it goes over. Nearly all of that is artwork and sound, so the code has
+`build.cmd` holds `winmine.exe` to a **131,072 byte (128K) budget** and
+fails the build if it goes over. Nearly all of that is artwork and sound, so the code has
 to fit in what is left. Two things make that work:
 
 * the program links **without the C run-time** — `MinerEntry()` in
@@ -146,7 +202,7 @@ to fit in what is left. Two things make that work:
 * it is built **32-bit with a fixed image base**, so there is no `.reloc`
   section.
 
-The result is about 118.8 KB, roughly 100 KB of which is the resource section.
+The result is about 123 KB, roughly 100 KB of which is the resource section.
 
 `build.cmd` picks a toolchain in this order:
 
@@ -159,7 +215,7 @@ The result is about 118.8 KB, roughly 100 KB of which is the resource section.
 
 Because the image has a fixed base it is not ASLR-randomised. If you would
 rather keep ASLR than the size budget, drop `/FIXED /DYNAMICBASE:NO` from the
-link line in `build.cmd`; the binary then comes out at 120,320 bytes.
+link line in `build.cmd`, at a cost of about 1.5 KB.
 
 The project directory may contain spaces and parentheses — `build.cmd` works on
 relative paths throughout.

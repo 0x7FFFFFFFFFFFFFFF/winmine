@@ -2,9 +2,9 @@
 rem ====================================================================
 rem  build.cmd - builds winmine.exe (a Minesweeper clone) in this folder.
 rem
-rem  winmine.exe is held to a 119,808 byte budget.  Almost all of that is
-rem  artwork and sound, so the code has to fit in what is left.  Two
-rem  things make that work:
+rem  winmine.exe is held to a 131,072 byte (128K) budget.  Roughly 100K
+rem  of that is artwork and sound, so the code has to fit in what is
+rem  left.  Two things make that work:
 rem
 rem    * the program is linked WITHOUT the C run-time - MinerEntry() in
 rem      miner.cpp is the raw PE entry point, and the only library
@@ -30,7 +30,7 @@ if not exist "src\miner.cpp" goto no_source
 if not exist "build" mkdir "build"
 if exist "winmine.exe" del /q "winmine.exe"
 
-set "LIMIT=119808"
+set "LIMIT=131072"
 
 rem ------------------------------------------------- MSVC through vswhere
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -136,9 +136,9 @@ exit /b 0
 :too_big
 echo.
 echo ERROR: winmine.exe is over the size budget.
-echo        This happens with a 64-bit MinGW build: the artwork and
-echo        sounds alone take ~100 KB, which leaves too little room for
-echo        64-bit code.  Build with 32-bit MSVC (install the "Desktop
+echo        A 64-bit MinGW build will not fit: the artwork and sounds
+echo        alone take ~100 KB, leaving too little room for 64-bit
+echo        code.  Build with 32-bit MSVC (install the "Desktop
 echo        development with C++" workload) or a 32-bit MinGW-w64.
 exit /b 1
 

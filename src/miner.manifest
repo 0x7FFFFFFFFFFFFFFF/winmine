@@ -13,4 +13,14 @@
             processorArchitecture="*"/>
     </dependentAssembly>
 </dependency>
+<application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+        <!-- Ask for real pixels.  Without this, Windows stretches the
+             whole window on a high-DPI display, which blurs the pixel
+             artwork and would make the ctrl+T block cover more than
+             the four physical pixels it is supposed to.  Zoom is what
+             makes the board bigger here, not the display scaling. -->
+        <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true</dpiAware>
+    </windowsSettings>
+</application>
 </assembly>

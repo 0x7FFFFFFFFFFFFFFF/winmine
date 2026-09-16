@@ -47,13 +47,41 @@
 #define Y_BUTTON        16      /* top of the smiley                  */
 
 /*---------------------------------------------------------------------
-    board limits.  The board is a fixed 32-byte-per-row array, which is
-    what caps the width at 30.
+    Board limits.  The board is allocated to fit, so the custom dialog
+    imposes no ceiling of its own: type whatever you like.  What stops
+    you is the machine - FAllocBoard() works out whether the board, the
+    flood-fill queue and the offscreen surface can all be had, and a
+    field that is too big for them is refused without disturbing the
+    game already in progress.
   -------------------------------------------------------------------*/
-#define BLK_STRIDE      32
-#define CBLK_ARRAY      864     /* 27 rows of 32 bytes                */
-#define CBLK_MAX        30      /* widest field                       */
-#define CROW_MAX        25      /* tallest field                      */
+#define CBLK_MIN        9       /* narrowest field                    */
+#define CROW_MIN        9       /* shortest field                     */
+#define CMINE_MIN       10      /* fewest mines                       */
+
+#define DXY_SURFACE_MAX 30000   /* largest client edge, in pixels     */
+#define CPX_SURFACE_MAX 64000000 /* and the largest total, in pixels  */
+
+/*---------------------------------------------------------------------
+    zoom - ctrl + wheel, as a percentage of the 1:1 layout
+  -------------------------------------------------------------------*/
+#define ZOOM_MIN        25
+#define ZOOM_MAX        400
+#define ZOOM_STEP       25
+
+/*---------------------------------------------------------------------
+    the Random button in the custom dialog picks each side from this
+    range, then works out a sensible number of mines to go with it
+  -------------------------------------------------------------------*/
+#define RAND_SIDE_MIN   50
+#define RAND_SIDE_MAX   200
+
+/*---------------------------------------------------------------------
+    ctrl+T corner peek: a two-by-two block - four pixels - in the very
+    bottom-left of the client area.  It is painted straight onto the
+    window in device pixels, so it stays four screen pixels whatever
+    the zoom is doing to everything else.
+  -------------------------------------------------------------------*/
+#define PEEK_EDGE       2
 
 /*---------------------------------------------------------------------
     tile indices inside the 16-tile block bitmap
@@ -165,8 +193,9 @@ static int          g_rgTime[3] = { 999, 999, 999 };
 static WCHAR        g_rgszName[3][32];
 static int          g_fUpdateReg;
 
-/* --- the board --------------------------------------------------- */
-static BYTE         g_rgBlk[CBLK_ARRAY];
+/* --- the board, allocated to fit the field ------------------------ */
+static BYTE        *g_rgBlk;               /* (cBlk+2) x (cRow+2)     */
+static int          g_cStride;             /* bytes per board row     */
 static int          g_cBlk = 9;            /* live width              */
 static int          g_cRow = 9;            /* live height             */
 
@@ -189,10 +218,35 @@ static int          g_xCur = -1;
 static int          g_yCur = -1;
 static int          g_iXyzzy;
 
-/* --- flood fill queue (a 100 entry ring, see StepXY) -------------- */
-static int          g_rgxVisit[100];
-static int          g_rgyVisit[100];
+/* --- flood fill queue (a ring, sized to the field - see StepXY) --- */
+static int         *g_rgxVisit;
+static int         *g_rgyVisit;
+static int          g_cVisitMax;
 static int          g_iVisitHead;
+
+/* --- zoom, and the 1:1 surface the interface is drawn on ---------- */
+static int          g_nZoom = 100;         /* percent                 */
+static HDC          g_hdcBack;
+static HBITMAP      g_hbmBack;
+static int          g_dxBack, g_dyBack;
+static int          g_fBackValid;
+
+/* --- space-bar panning, the hand tool ----------------------------- */
+static int          g_fSpaceDown;
+static int          g_fPanning;
+static POINT        g_ptPanGrab;           /* cursor when grabbed     */
+static POINT        g_ptPanOrigin;         /* window origin then      */
+static HCURSOR      g_hcurArrow;
+static HCURSOR      g_hcurPan;
+
+/* --- how many digits the mine counter needs ----------------------- */
+static int          g_cLedDigits = 3;
+
+/* --- the ctrl+T corner peek --------------------------------------- */
+static int          g_fCtrlDown;           /* tracked, not polled     */
+static int          g_fPeek;
+static int          g_xPeek = -1;
+static int          g_yPeek = -1;
 
 /* --- window metrics ---------------------------------------------- */
 static int          g_dxWindow;            /* SM_CXBORDER + 1         */
@@ -274,7 +328,15 @@ static int MinerRand(void)
   =====================================================================*/
 static inline BYTE *PblkAt(int x, int y)
 {
-    return &g_rgBlk[x + y * BLK_STRIDE];
+    return &g_rgBlk[x + y * g_cStride];
+}
+
+/* decimal width of a non-negative number */
+static int CDigits(int n)
+{
+    int c = 1;
+    while (n >= 10) { n /= 10; c++; }
+    return c;
 }
 
 static int ClampInt(int v, int lo, int hi)
@@ -446,10 +508,10 @@ static int FIsColourScreen(void)
 
 static void ReadPreferences(void)
 {
-    g_cRow = g_cRowCfg = ReadIniInt(INI_HEIGHT,     9,  9, CROW_MAX);
-    g_cBlk = g_cBlkCfg = ReadIniInt(INI_WIDTH,      9,  9, CBLK_MAX);
+    g_cRow = g_cRowCfg = ReadIniInt(INI_HEIGHT, 9, CROW_MIN, 0x7FFFFFF);
+    g_cBlk = g_cBlkCfg = ReadIniInt(INI_WIDTH,  9, CBLK_MIN, 0x7FFFFFF);
     g_wGameType        = ReadIniInt(INI_DIFFICULTY, 0,  0, 3);
-    g_cMines           = ReadIniInt(INI_MINES,     10, 10, 999);
+    g_cMines           = ReadIniInt(INI_MINES, 10, CMINE_MIN, 0x7FFFFFF);
     g_xWindow          = ReadIniInt(INI_XPOS,      80,  0, 1024);
     g_yWindow          = ReadIniInt(INI_YPOS,      80,  0, 1024);
     g_fSound           = ReadIniInt(INI_SOUND,      0,  0, 3);
@@ -606,14 +668,93 @@ static BOOL FLoadBmp(void)
 }
 
 /*=====================================================================
+    zoom, and the offscreen surface
+
+    The interface is drawn 1:1 onto g_hdcBack and then stretched onto
+    the window.  Doing it that way means the zoom scales *everything*
+    by the same factor - the pixel artwork and the one-pixel 3D edges
+    alike - and the drawing code below stays in plain 1:1 coordinates.
+  =====================================================================*/
+static int LogToDev(int v) { return MulDiv(v, g_nZoom, 100); }
+static int DevToLog(int v) { return MulDiv(v, 100, g_nZoom); }
+
+static void FreeBack(void)
+{
+    if (g_hdcBack) { DeleteDC(g_hdcBack);     g_hdcBack = NULL; }
+    if (g_hbmBack) { DeleteObject(g_hbmBack); g_hbmBack = NULL; }
+    g_dxBack = g_dyBack = 0;
+    g_fBackValid = 0;
+}
+
+static BOOL FEnsureBack(void)
+{
+    HDC hdc;
+
+    if (g_hdcBack && g_dxBack == g_dxClient && g_dyBack == g_dyClient)
+        return TRUE;
+
+    FreeBack();
+    if (g_dxClient <= 0 || g_dyClient <= 0 || g_hwnd == NULL)
+        return FALSE;
+
+    hdc = GetDC(g_hwnd);
+    if (hdc == NULL)
+        return FALSE;
+    g_hdcBack = CreateCompatibleDC(hdc);
+    g_hbmBack = CreateCompatibleBitmap(hdc, g_dxClient, g_dyClient);
+    ReleaseDC(g_hwnd, hdc);
+
+    if (!g_hdcBack || !g_hbmBack) {
+        FreeBack();
+        return FALSE;
+    }
+    SelectObject(g_hdcBack, g_hbmBack);
+    g_dxBack = g_dxClient;
+    g_dyBack = g_dyClient;
+    return TRUE;
+}
+
+/* copy one 1:1 rectangle of the surface onto the window, scaled */
+static void Present(int x, int y, int cx, int cy)
+{
+    HDC hdc;
+
+    if (!g_hdcBack || g_hwnd == NULL)
+        return;
+    hdc = GetDC(g_hwnd);
+    if (hdc == NULL)
+        return;
+
+    if (g_nZoom == 100) {
+        BitBlt(hdc, x, y, cx, cy, g_hdcBack, x, y, SRCCOPY);
+    } else {
+        int xd  = LogToDev(x);
+        int yd  = LogToDev(y);
+        int cxd = LogToDev(x + cx) - xd;
+        int cyd = LogToDev(y + cy) - yd;
+
+        /* Nearest neighbour, both ways.  HALFTONE would dither these
+           flat greys into a checkerboard, which is not what the
+           artwork should ever look like. */
+        SetStretchBltMode(hdc, COLORONCOLOR);
+        StretchBlt(hdc, xd, yd, cxd, cyd, g_hdcBack, x, y, cx, cy, SRCCOPY);
+    }
+    ReleaseDC(g_hwnd, hdc);
+}
+
+/*=====================================================================
     drawing
   =====================================================================*/
 static void DisplayBlk(int x, int y)
 {
-    HDC hdc = GetDC(g_hwnd);
-    BitBlt(hdc, x * DX_BLK - 4, y * DY_BLK + 39, DX_BLK, DY_BLK,
+    int xPix = x * DX_BLK - 4;
+    int yPix = y * DY_BLK + 39;
+
+    if (!g_hdcBack)
+        return;
+    BitBlt(g_hdcBack, xPix, yPix, DX_BLK, DY_BLK,
            g_rghdcBlk[*PblkAt(x, y) & MASK_ICON], 0, 0, SRCCOPY);
-    ReleaseDC(g_hwnd, hdc);
+    Present(xPix, yPix, DX_BLK, DY_BLK);
 }
 
 static void DrawField(HDC hdc)
@@ -634,9 +775,10 @@ static void DrawField(HDC hdc)
 
 static void DisplayField(void)
 {
-    HDC hdc = GetDC(g_hwnd);
-    DrawField(hdc);
-    ReleaseDC(g_hwnd, hdc);
+    if (!g_hdcBack)
+        return;
+    DrawField(g_hdcBack);
+    Present(X_FIELD, Y_FIELD, g_cBlk * DX_BLK, g_cRow * DY_BLK);
 }
 
 static void DrawLed(HDC hdc, int x, int iLed)
@@ -646,24 +788,39 @@ static void DrawLed(HDC hdc, int x, int iLed)
                       g_pbmiLed, DIB_RGB_COLORS);
 }
 
+/* Three digits, as ever - but a field can now hold more than 999
+   mines, so the readout grows a digit at a time to fit the count.  A
+   minus sign costs one of them, which is what the classic display did
+   too (ten flags too many reads "-10"). */
 static void DrawBombCount(HDC hdc)
 {
     DWORD dwLayout = GetLayout(hdc);
-    int   iHundred, n;
+    int   rgLed[16];
+    int   cDigits  = g_cLedDigits;
+    int   n        = g_cBombLeft;
+    int   fNeg     = 0;
+    int   i, nMax;
 
     if (dwLayout & LAYOUT_RTL)
         SetLayout(hdc, 0);
 
-    if (g_cBombLeft < 0) {
-        iHundred = LED_MINUS;
-        n        = -g_cBombLeft;
-    } else {
-        iHundred = g_cBombLeft / 100;
-        n        = g_cBombLeft;
+    if (n < 0) { fNeg = 1; n = -n; }
+
+    nMax = 1;
+    for (i = fNeg ? 1 : 0; i < cDigits; i++)
+        nMax *= 10;
+    if (n >= nMax)
+        n = nMax - 1;
+
+    for (i = cDigits - 1; i >= 0; i--) {
+        rgLed[i] = n % 10;
+        n /= 10;
     }
-    DrawLed(hdc, 17, iHundred);
-    DrawLed(hdc, 30, (n % 100) / 10);
-    DrawLed(hdc, 43, (n % 100) % 10);
+    if (fNeg)
+        rgLed[0] = LED_MINUS;
+
+    for (i = 0; i < cDigits; i++)
+        DrawLed(hdc, 17 + i * DX_LED, rgLed[i]);
 
     if (dwLayout & LAYOUT_RTL)
         SetLayout(hdc, dwLayout);
@@ -671,9 +828,10 @@ static void DrawBombCount(HDC hdc)
 
 static void DisplayBombCount(void)
 {
-    HDC hdc = GetDC(g_hwnd);
-    DrawBombCount(hdc);
-    ReleaseDC(g_hwnd, hdc);
+    if (!g_hdcBack)
+        return;
+    DrawBombCount(g_hdcBack);
+    Present(17, Y_LED, g_cLedDigits * DX_LED, DY_LED);
 }
 
 static void DrawTime(HDC hdc)
@@ -695,9 +853,10 @@ static void DrawTime(HDC hdc)
 
 static void DisplayTime(void)
 {
-    HDC hdc = GetDC(g_hwnd);
-    DrawTime(hdc);
-    ReleaseDC(g_hwnd, hdc);
+    if (!g_hdcBack)
+        return;
+    DrawTime(g_hdcBack);
+    Present(g_dxClient - g_dxWindow - 0x38, Y_LED, 3 * DX_LED, DY_LED);
 }
 
 static void DrawButton(HDC hdc, int iFace)
@@ -710,9 +869,10 @@ static void DrawButton(HDC hdc, int iFace)
 
 static void DisplayButton(int iFace)
 {
-    HDC hdc = GetDC(g_hwnd);
-    DrawButton(hdc, iFace);
-    ReleaseDC(g_hwnd, hdc);
+    if (!g_hdcBack)
+        return;
+    DrawButton(g_hdcBack, iFace);
+    Present((g_dxClient - DX_BUTTON) >> 1, Y_BUTTON, DX_BUTTON, DY_BUTTON);
 }
 
 /*---------------------------------------------------------------------
@@ -778,8 +938,9 @@ static void DrawBackground(HDC hdc)
     DrawBorder(hdc, 9, 0x34, dx - 10, dy - 10, 3, MINE_SUNK);
     /* the status panel */
     DrawBorder(hdc, 9, 9, dx - 10, 0x2D, 2, MINE_SUNK);
-    /* the two LED displays */
-    DrawBorder(hdc, 0x10, 0x0F, 0x38, 0x27, 1, MINE_SUNK);
+    /* the two LED displays; the left one grows with the mine count */
+    DrawBorder(hdc, 0x10, 0x0F, 0x11 + g_cLedDigits * DX_LED, 0x27,
+               1, MINE_SUNK);
     DrawBorder(hdc, (dx - g_dxWindow) - 0x39, 0x0F,
                     (dx - g_dxWindow) - 0x11, 0x27, 1, MINE_SUNK);
     /* the smiley */
@@ -789,6 +950,16 @@ static void DrawBackground(HDC hdc)
 
 static void DrawScreen(HDC hdc)
 {
+    RECT rc;
+
+    /* Lay the face colour down first.  Drawing straight to the window
+       used to get this for free from the class background brush; now
+       that the interface is composed offscreen, the surface starts out
+       undefined and has to be cleared here or every gap between the
+       borders, digits and cells comes out black. */
+    SetRect(&rc, 0, 0, g_dxClient, g_dyClient);
+    FillRect(hdc, &rc, (HBRUSH)GetStockObject(LTGRAY_BRUSH));
+
     DrawBackground(hdc);
     DrawBombCount(hdc);
     DrawButton(hdc, g_iButtonCur);
@@ -798,9 +969,11 @@ static void DrawScreen(HDC hdc)
 
 static void DisplayScreen(void)
 {
-    HDC hdc = GetDC(g_hwnd);
-    DrawScreen(hdc);
-    ReleaseDC(g_hwnd, hdc);
+    if (!FEnsureBack())
+        return;
+    DrawScreen(g_hdcBack);
+    g_fBackValid = 1;
+    Present(0, 0, g_dxClient, g_dyClient);
 }
 
 /*=====================================================================
@@ -829,7 +1002,7 @@ static void MoveToClient(void)
     RECT  rc;
     DWORD dwStyle = (DWORD)GetWindowLongPtrW(g_hwnd, GWL_STYLE);
 
-    SetRect(&rc, 0, 0, g_dxClient, g_dyClient);
+    SetRect(&rc, 0, 0, LogToDev(g_dxClient), LogToDev(g_dyClient));
     AdjustWindowRect(&rc, dwStyle, GetMenu(g_hwnd) != NULL);
     MoveWindow(g_hwnd, g_xWindow + rc.left, g_yWindow + rc.top,
                rc.right - rc.left, rc.bottom - rc.top, TRUE);
@@ -855,10 +1028,22 @@ static void AdjustWindow(UINT wFlags)
     g_dxClient = g_cBlk * DX_BLK + DX_WINDOW;
     g_dyClient = g_cRow * DY_BLK + DY_WINDOW;
 
-    d = g_dxClient + g_xWindow - DxpScreen(0);
-    if (d > 0) { wFlags |= ADJUST_MOVE; g_xWindow -= d; }
-    d = g_dyClient + g_yWindow - DxpScreen(1);
-    if (d > 0) { wFlags |= ADJUST_MOVE; g_yWindow -= d; }
+    /* pull the window back on screen if it would hang off the edge -
+       but never past the top-left corner, because a field bigger than
+       the screen is meant to be reached with the space-bar pan rather
+       than by losing its title bar off the top */
+    d = LogToDev(g_dxClient) + g_xWindow - DxpScreen(0);
+    if (d > 0) {
+        wFlags |= ADJUST_MOVE;
+        g_xWindow -= d;
+        if (g_xWindow < 0) g_xWindow = 0;
+    }
+    d = LogToDev(g_dyClient) + g_yWindow - DxpScreen(1);
+    if (d > 0) {
+        wFlags |= ADJUST_MOVE;
+        g_yWindow -= d;
+        if (g_yWindow < 0) g_yWindow = 0;
+    }
 
     if (g_fFrozen)
         return;
@@ -873,9 +1058,8 @@ static void AdjustWindow(UINT wFlags)
     }
 
     if (wFlags & ADJUST_PAINT) {
-        RECT rc;
-        SetRect(&rc, 0, 0, g_dxClient, g_dyClient);
-        InvalidateRect(g_hwnd, &rc, TRUE);
+        g_fBackValid = 0;
+        InvalidateRect(g_hwnd, NULL, TRUE);
     }
 }
 
@@ -909,11 +1093,64 @@ static void SetMenuBar(UINT fMenu)
 /*=====================================================================
     the board
   =====================================================================*/
+/*---------------------------------------------------------------------
+    Everything a field of this size needs: the board, the flood-fill
+    queue and room for the offscreen surface.  It succeeds or fails as
+    a unit, so a field the machine cannot manage is turned away with
+    the game already in progress left untouched.
+  -------------------------------------------------------------------*/
+static BOOL FAllocBoard(int cBlk, int cRow)
+{
+    HANDLE hHeap = GetProcessHeap();
+    BYTE  *pbNew;
+    int   *pxNew, *pyNew;
+    int    dx, dy, cCell;
+
+    if (cBlk < 1 || cRow < 1)
+        return FALSE;
+
+    /* Every limit below is checked by division, so nothing ever
+       overflows on the way to finding out that it would have.  Once
+       the surface fits, cBlk * cRow is at most surface / 256 and the
+       rest of the arithmetic is comfortably inside an int. */
+    if (cBlk > (DXY_SURFACE_MAX - DX_WINDOW) / DX_BLK) return FALSE;
+    if (cRow > (DXY_SURFACE_MAX - DY_WINDOW) / DY_BLK) return FALSE;
+
+    dx = cBlk * DX_BLK + DX_WINDOW;
+    dy = cRow * DY_BLK + DY_WINDOW;
+    if (dy > CPX_SURFACE_MAX / dx)
+        return FALSE;
+
+    cCell = cBlk * cRow;
+
+    pbNew = (BYTE *)HeapAlloc(hHeap, 0, (SIZE_T)(cBlk + 2) * (cRow + 2));
+    pxNew = (int *)HeapAlloc(hHeap, 0, (SIZE_T)(cCell + 2) * sizeof(int));
+    pyNew = (int *)HeapAlloc(hHeap, 0, (SIZE_T)(cCell + 2) * sizeof(int));
+    if (!pbNew || !pxNew || !pyNew) {
+        if (pbNew) HeapFree(hHeap, 0, pbNew);
+        if (pxNew) HeapFree(hHeap, 0, pxNew);
+        if (pyNew) HeapFree(hHeap, 0, pyNew);
+        return FALSE;
+    }
+
+    if (g_rgBlk)    HeapFree(hHeap, 0, g_rgBlk);
+    if (g_rgxVisit) HeapFree(hHeap, 0, g_rgxVisit);
+    if (g_rgyVisit) HeapFree(hHeap, 0, g_rgyVisit);
+
+    g_rgBlk     = pbNew;
+    g_rgxVisit  = pxNew;
+    g_rgyVisit  = pyNew;
+    g_cStride   = cBlk + 2;
+    g_cVisitMax = cCell + 2;
+    return TRUE;
+}
+
 static void InitBlks(void)
 {
     int i;
+    int cb = (g_cBlk + 2) * (g_cRow + 2);
 
-    for (i = 0; i < CBLK_ARRAY; i++)
+    for (i = 0; i < cb; i++)
         g_rgBlk[i] = BLK_BLANKUP;
 
     for (i = 0; i < g_cBlk + 2; i++) {
@@ -1002,9 +1239,10 @@ static void PopBlk(int x, int y)
 }
 
 /*---------------------------------------------------------------------
-    flood fill.  The original uses a 100-entry ring buffer rather than
-    recursion; empty cells push their coordinates and the caller walks
-    the ring uncovering all eight neighbours of each.
+    Flood fill through a ring buffer rather than recursion: empty cells
+    push their coordinates and the caller walks the ring uncovering all
+    eight neighbours of each.  The ring holds one entry per cell, so it
+    can never lap itself and drop a pending square.
   -------------------------------------------------------------------*/
 static void StepBlk(int x, int y)
 {
@@ -1026,7 +1264,7 @@ static void StepBlk(int x, int y)
     if (c == 0) {
         g_rgxVisit[g_iVisitHead] = x;
         g_rgyVisit[g_iVisitHead] = y;
-        if (++g_iVisitHead == 100)
+        if (++g_iVisitHead == g_cVisitMax)
             g_iVisitHead = 0;
     }
 }
@@ -1053,7 +1291,7 @@ static void StepXY(int x, int y)
         StepBlk(xT,     yT + 1);
         StepBlk(xT + 1, yT + 1);
 
-        if (++i == 100)
+        if (++i == g_cVisitMax)
             i = 0;
     } while (i != g_iVisitHead);
 }
@@ -1093,9 +1331,26 @@ static void GameOver(int fWon)
 static void StartGame(void)
 {
     UINT wFlags;
-    int  n;
+    int  n, x, y, cCells;
 
     g_fTimer = 0;
+
+    /* resize the board if the configured field changed */
+    if (g_rgBlk == NULL || g_cBlkCfg != g_cBlk || g_cRowCfg != g_cRow) {
+        if (!FAllocBoard(g_cBlkCfg, g_cRowCfg)) {
+            ReportErr(IDS_ERR_MEMORY);
+            if (g_rgBlk != NULL) {
+                g_cBlkCfg = g_cBlk;         /* keep the field we have */
+                g_cRowCfg = g_cRow;
+            } else {                        /* nothing to fall back on */
+                g_cMines  = c_rgPreset[LEVEL_BEGIN][0];
+                g_cRowCfg = c_rgPreset[LEVEL_BEGIN][1];
+                g_cBlkCfg = c_rgPreset[LEVEL_BEGIN][2];
+                if (!FAllocBoard(g_cBlkCfg, g_cRowCfg))
+                    return;
+            }
+        }
+    }
 
     wFlags = (g_cBlkCfg == g_cBlk && g_cRowCfg == g_cRow)
              ? ADJUST_PAINT : (ADJUST_MOVE | ADJUST_PAINT);
@@ -1103,19 +1358,44 @@ static void StartGame(void)
     g_cBlk = g_cBlkCfg;
     g_cRow = g_cRowCfg;
 
+    /* at least one square has to stay clear, or the placement below
+       would never find a home for the last mine */
+    cCells = g_cBlk * g_cRow;
+    if (g_cMines > cCells - 1) g_cMines = cCells - 1;
+    if (g_cMines < 1)          g_cMines = 1;
+
+    g_cLedDigits = CDigits(g_cMines);
+    if (g_cLedDigits < 3)
+        g_cLedDigits = 3;
+
     InitBlks();
     g_iButtonCur = FACE_HAPPY;
 
-    for (n = g_cMines; n > 0; n--) {
-        int x, y;
-        do {
-            x = MinerRand() % g_cBlk;
-            y = MinerRand() % g_cRow;
-        } while (*PblkAt(x + 1, y + 1) & MASK_BOMB);
-        *PblkAt(x + 1, y + 1) |= MASK_BOMB;
+    if (g_cMines * 2 <= cCells) {
+        for (n = g_cMines; n > 0; n--) {
+            do {
+                x = MinerRand() % g_cBlk;
+                y = MinerRand() % g_cRow;
+            } while (*PblkAt(x + 1, y + 1) & MASK_BOMB);
+            *PblkAt(x + 1, y + 1) |= MASK_BOMB;
+        }
+    } else {
+        /* More than half the field is mines.  Picking at random would
+           spend most of its time landing on squares already taken, so
+           mine the lot and pick the gaps instead. */
+        for (y = 1; y <= g_cRow; y++)
+            for (x = 1; x <= g_cBlk; x++)
+                *PblkAt(x, y) |= MASK_BOMB;
+        for (n = cCells - g_cMines; n > 0; n--) {
+            do {
+                x = MinerRand() % g_cBlk;
+                y = MinerRand() % g_cRow;
+            } while ((*PblkAt(x + 1, y + 1) & MASK_BOMB) == 0);
+            *PblkAt(x + 1, y + 1) &= (BYTE)~MASK_BOMB;
+        }
     }
 
-    g_cBlkTotal = g_cRow * g_cBlk - g_cMines;
+    g_cBlkTotal = cCells - g_cMines;
     g_cSec      = 0;
     g_cBombLeft = g_cMines;
     g_cBlkVisit = 0;
@@ -1372,10 +1652,10 @@ static BOOL FButtonHit(LPARAM lParam)
     pt.x = GET_X_LPARAM(lParam);
     pt.y = GET_Y_LPARAM(lParam);
 
-    rc.left   = (g_dxClient - DX_BUTTON) >> 1;
-    rc.right  = rc.left + DX_BUTTON;
-    rc.top    = Y_BUTTON;
-    rc.bottom = Y_BUTTON + DY_BUTTON;
+    rc.left   = LogToDev((g_dxClient - DX_BUTTON) >> 1);
+    rc.right  = LogToDev(((g_dxClient - DX_BUTTON) >> 1) + DX_BUTTON);
+    rc.top    = LogToDev(Y_BUTTON);
+    rc.bottom = LogToDev(Y_BUTTON + DY_BUTTON);
 
     if (!PtInRect(&rc, pt))
         return FALSE;
@@ -1422,14 +1702,44 @@ static const DWORD c_rgdwHelpBest[] = {
     ID_BEST_NAME3, 1004, 0, 0
 };
 
-static UINT GetDlgInt(HWND hDlg, int id, UINT lo, UINT hi)
+/* a field of the custom dialog: a floor, but no ceiling.  Whatever
+   comes back is handed to StartGame, which is the thing that knows
+   whether a field that size can actually be built. */
+static UINT GetDlgIntMin(HWND hDlg, int id, UINT lo)
 {
     BOOL fOk;
     UINT v = GetDlgItemInt(hDlg, id, &fOk, FALSE);
 
-    if (v < lo) return lo;
-    if (v > hi) return hi;
-    return v;
+    return (!fOk || v < lo) ? lo : v;
+}
+
+/*---------------------------------------------------------------------
+    How many mines belong on a cBlk x cRow field.
+
+    The presets run 12% (beginner), 16% (intermediate) and 21%
+    (expert), so density climbs with size.  This carries that line on:
+    16% at 2,500 squares up to 21% at 40,000 and flat after that -
+    dense enough to stay interesting, short of the point where a big
+    board turns into pure guesswork.  A little jitter keeps two presses
+    of Random from producing the same game.
+  -------------------------------------------------------------------*/
+static int CMinesForField(int cBlk, int cRow)
+{
+    int cCells = cBlk * cRow;
+    int nPerMil, cMines, nJitter;
+
+    if (cCells <= 2500)       nPerMil = 160;
+    else if (cCells >= 40000) nPerMil = 210;
+    else nPerMil = 160 + MulDiv(cCells - 2500, 50, 40000 - 2500);
+
+    cMines  = MulDiv(cCells, nPerMil, 1000);
+    nJitter = cMines / 20;                      /* +/- 5% */
+    if (nJitter > 0)
+        cMines += (MinerRand() % (nJitter * 2 + 1)) - nJitter;
+
+    if (cMines < CMINE_MIN)   cMines = CMINE_MIN;
+    if (cMines > cCells - 1)  cMines = cCells - 1;
+    return cMines;
 }
 
 static INT_PTR CALLBACK PrefDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
@@ -1455,17 +1765,25 @@ static INT_PTR CALLBACK PrefDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
 
     case WM_COMMAND:
         switch (LOWORD(wParam)) {
-        case IDOK: {
-            UINT cMax;
-            g_cRowCfg = (int)GetDlgInt(hDlg, ID_PREF_HEIGHT, 9, 24);
-            g_cBlkCfg = (int)GetDlgInt(hDlg, ID_PREF_WIDTH,  9, 30);
-            cMax = (UINT)((g_cBlkCfg - 1) * (g_cRowCfg - 1));
-            if (cMax > 999)
-                cMax = 999;
-            g_cMines = (int)GetDlgInt(hDlg, ID_PREF_MINE, 10, cMax);
-            EndDialog(hDlg, TRUE);
+        case ID_PREF_RANDOM: {
+            int cBlk = RAND_SIDE_MIN +
+                       MinerRand() % (RAND_SIDE_MAX - RAND_SIDE_MIN + 1);
+            int cRow = RAND_SIDE_MIN +
+                       MinerRand() % (RAND_SIDE_MAX - RAND_SIDE_MIN + 1);
+
+            SetDlgItemInt(hDlg, ID_PREF_WIDTH,  (UINT)cBlk, FALSE);
+            SetDlgItemInt(hDlg, ID_PREF_HEIGHT, (UINT)cRow, FALSE);
+            SetDlgItemInt(hDlg, ID_PREF_MINE,
+                          (UINT)CMinesForField(cBlk, cRow), FALSE);
             return TRUE;
         }
+        case IDOK:
+            g_cRowCfg = (int)GetDlgIntMin(hDlg, ID_PREF_HEIGHT, CROW_MIN);
+            g_cBlkCfg = (int)GetDlgIntMin(hDlg, ID_PREF_WIDTH,  CBLK_MIN);
+            g_cMines  = (int)GetDlgIntMin(hDlg, ID_PREF_MINE,   CMINE_MIN);
+            EndDialog(hDlg, TRUE);
+            return TRUE;
+
         case IDCANCEL:
             EndDialog(hDlg, TRUE);
             return TRUE;
@@ -1633,9 +1951,9 @@ static void DoHelp(int iTopic, DWORD dwCmd)
   =====================================================================*/
 static const WCHAR c_szXyzzy[] = L"XYZZY";
 
-/* client pixel -> cell index */
-#define XFromLp(lp)  ((GET_X_LPARAM(lp) + 4) >> 4)
-#define YFromLp(lp)  ((GET_Y_LPARAM(lp) - 0x27) >> 4)
+/* client pixel -> cell index, undoing the zoom on the way */
+#define XFromLp(lp)  ((DevToLog(GET_X_LPARAM(lp)) + 4) >> 4)
+#define YFromLp(lp)  ((DevToLog(GET_Y_LPARAM(lp)) - 0x27) >> 4)
 
 static void StartTracking(HWND hwnd, LPARAM lParam)
 {
@@ -1685,6 +2003,72 @@ static void DoXyzzy(WPARAM wParam, LPARAM lParam)
     ReleaseDC(NULL, hdc);
 }
 
+/*---------------------------------------------------------------------
+    The ctrl+T peek.  Same question as XYZZY - is the square under the
+    cursor a mine - but answered in the corner of the window instead of
+    on the desktop: red for yes, green for no.  The block is filled in
+    device pixels, deliberately outside the zoomed surface, so it stays
+    exactly four screen pixels however far the interface is zoomed in.
+  -------------------------------------------------------------------*/
+static void PeekRect(LPRECT prc)
+{
+    GetClientRect(g_hwnd, prc);
+    prc->top  = prc->bottom - PEEK_EDGE;
+    prc->right = prc->left + PEEK_EDGE;
+}
+
+static void DrawPeek(void)
+{
+    RECT   rc;
+    HDC    hdc;
+    HBRUSH hbr;
+
+    if (!g_fPeek || g_hwnd == NULL || g_rgBlk == NULL)
+        return;
+    if (g_xPeek < 1 || g_yPeek < 1 || g_xPeek > g_cBlk || g_yPeek > g_cRow)
+        return;
+
+    hdc = GetDC(g_hwnd);
+    if (hdc == NULL)
+        return;
+    PeekRect(&rc);
+    hbr = CreateSolidBrush((*PblkAt(g_xPeek, g_yPeek) & MASK_BOMB)
+                           ? RGB(255, 0, 0) : RGB(0, 255, 0));
+    if (hbr) {
+        FillRect(hdc, &rc, hbr);
+        DeleteObject(hbr);
+    }
+    ReleaseDC(g_hwnd, hdc);
+}
+
+static void UpdatePeek(LPARAM lParam)
+{
+    if (!g_fPeek)
+        return;
+    g_xPeek = XFromLp(lParam);
+    g_yPeek = YFromLp(lParam);
+    DrawPeek();
+}
+
+static void TogglePeek(HWND hwnd)
+{
+    RECT rc;
+
+    g_fPeek = !g_fPeek;
+    if (g_fPeek) {
+        POINT pt;
+        if (GetCursorPos(&pt) && ScreenToClient(hwnd, &pt)) {
+            g_xPeek = (DevToLog(pt.x) + 4) >> 4;
+            g_yPeek = (DevToLog(pt.y) - 0x27) >> 4;
+        }
+        DrawPeek();
+    } else {
+        /* put the corner back the way it was */
+        PeekRect(&rc);
+        InvalidateRect(hwnd, &rc, FALSE);
+    }
+}
+
 static LRESULT CALLBACK MineWndProc(HWND hwnd, UINT msg, WPARAM wParam,
                                     LPARAM lParam)
 {
@@ -1703,10 +2087,71 @@ static LRESULT CALLBACK MineWndProc(HWND hwnd, UINT msg, WPARAM wParam,
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC hdc = BeginPaint(hwnd, &ps);
-        DrawScreen(hdc);
+
+        if (FEnsureBack()) {
+            if (!g_fBackValid) {
+                DrawScreen(g_hdcBack);
+                g_fBackValid = 1;
+            }
+            if (g_nZoom == 100) {
+                BitBlt(hdc, ps.rcPaint.left, ps.rcPaint.top,
+                       ps.rcPaint.right - ps.rcPaint.left,
+                       ps.rcPaint.bottom - ps.rcPaint.top,
+                       g_hdcBack, ps.rcPaint.left, ps.rcPaint.top, SRCCOPY);
+            } else {
+                SetStretchBltMode(hdc, COLORONCOLOR);
+                StretchBlt(hdc, 0, 0,
+                           LogToDev(g_dxClient), LogToDev(g_dyClient),
+                           g_hdcBack, 0, 0, g_dxClient, g_dyClient, SRCCOPY);
+            }
+        }
         EndPaint(hwnd, &ps);
+        DrawPeek();
         return 0;
     }
+
+    case WM_MOUSEWHEEL:
+        /* ctrl + wheel zooms the whole interface */
+        if (GET_KEYSTATE_WPARAM(wParam) & MK_CONTROL) {
+            int nOld = g_nZoom;
+
+            g_nZoom += (GET_WHEEL_DELTA_WPARAM(wParam) > 0) ? ZOOM_STEP
+                                                            : -ZOOM_STEP;
+            g_nZoom = ClampInt(g_nZoom, ZOOM_MIN, ZOOM_MAX);
+            if (g_nZoom != nOld)
+                AdjustWindow(ADJUST_MOVE | ADJUST_PAINT);
+            return 0;
+        }
+        break;
+
+    case WM_SETCURSOR:
+        if ((g_fSpaceDown || g_fPanning) && LOWORD(lParam) == HTCLIENT) {
+            SetCursor(g_hcurPan);
+            return TRUE;
+        }
+        break;
+
+    case WM_KILLFOCUS:
+        g_fSpaceDown = 0;
+        g_fCtrlDown  = 0;
+        if (g_fPanning) {
+            g_fPanning = 0;
+            ReleaseCapture();
+        }
+        break;
+
+    case WM_KEYUP:
+        if (wParam == VK_CONTROL)
+            g_fCtrlDown = 0;
+        if (wParam == VK_SPACE) {
+            g_fSpaceDown = 0;
+            if (g_fPanning) {
+                g_fPanning = 0;
+                ReleaseCapture();
+            }
+            SetCursor(g_hcurArrow);
+        }
+        break;
 
     case WM_MOVE:
         if ((g_fStatus & STATUS_ICON) == 0) {
@@ -1740,6 +2185,33 @@ static LRESULT CALLBACK MineWndProc(HWND hwnd, UINT msg, WPARAM wParam,
 
     case WM_KEYDOWN:
         switch (wParam) {
+        case VK_SPACE:
+            /* the hand tool: hold space, then drag with the left
+               button to slide the window around */
+            if (!g_fSpaceDown) {
+                g_fSpaceDown = 1;
+                SetCursor(g_hcurPan);
+            }
+            break;
+
+        case VK_CONTROL:
+            g_fCtrlDown = 1;
+            g_iXyzzy = 0;
+            break;
+
+        case 'T':
+            /* the tracked flag, not GetKeyState: that reports a
+               snapshot from when this thread last took an input
+               message off its own queue */
+            if (g_fCtrlDown || (GetKeyState(VK_CONTROL) & 0x8000)) {
+                TogglePeek(hwnd);
+                break;
+            }
+            if (g_iXyzzy < 5)
+                g_iXyzzy = (c_szXyzzy[g_iXyzzy] == (WCHAR)wParam)
+                           ? g_iXyzzy + 1 : 0;
+            break;
+
         case VK_SHIFT:
             if (g_iXyzzy > 4)
                 g_iXyzzy ^= 0x14;
@@ -1848,6 +2320,17 @@ static LRESULT CALLBACK MineWndProc(HWND hwnd, UINT msg, WPARAM wParam,
 
     /*--------------------------------------------------------------*/
     case WM_LBUTTONDOWN:
+        if (g_fSpaceDown) {
+            RECT rc;
+            GetCursorPos(&g_ptPanGrab);
+            GetWindowRect(hwnd, &rc);
+            g_ptPanOrigin.x = rc.left;
+            g_ptPanOrigin.y = rc.top;
+            g_fPanning = 1;
+            SetCapture(hwnd);
+            SetCursor(g_hcurPan);
+            return 0;
+        }
         if (g_fIgnoreClick) { g_fIgnoreClick = 0; return 0; }
         if (FButtonHit(lParam))             return 0;
         if ((g_fStatus & STATUS_PLAY) == 0) break;
@@ -1882,11 +2365,27 @@ static LRESULT CALLBACK MineWndProc(HWND hwnd, UINT msg, WPARAM wParam,
     case WM_LBUTTONUP:
     case WM_RBUTTONUP:
     case WM_MBUTTONUP:
+        if (g_fPanning) {
+            g_fPanning = 0;
+            ReleaseCapture();
+            return 0;
+        }
         if (g_fBlockTrack)
             ReleaseTracking();
         break;
 
     case WM_MOUSEMOVE:
+        if (g_fPanning) {
+            POINT pt;
+            if (GetCursorPos(&pt))
+                SetWindowPos(hwnd, NULL,
+                             g_ptPanOrigin.x + (pt.x - g_ptPanGrab.x),
+                             g_ptPanOrigin.y + (pt.y - g_ptPanGrab.y),
+                             0, 0,
+                             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            return 0;
+        }
+        UpdatePeek(lParam);
         if (g_fBlockTrack) {
             if ((g_fStatus & STATUS_PLAY) == 0)
                 ReleaseTracking();
@@ -1914,6 +2413,8 @@ static int RunApp(HINSTANCE hInst, int nCmdShow)
     RECT      rc;
 
     g_hInst = hInst;
+    g_hcurArrow = LoadCursorW(NULL, IDC_ARROW);
+    g_hcurPan   = LoadCursorW(NULL, IDC_SIZEALL);
     InitPreferences();
 
     g_fFrozen = (nCmdShow == SW_SHOWMINIMIZED ||
@@ -1929,7 +2430,7 @@ static int RunApp(HINSTANCE hInst, int nCmdShow)
     wc.cbWndExtra    = 0;
     wc.hInstance     = g_hInst;
     wc.hIcon         = LoadIconW(g_hInst, MAKEINTRESOURCEW(ID_ICON_MAIN));
-    wc.hCursor       = LoadCursorW(NULL, IDC_ARROW);
+    wc.hCursor       = g_hcurArrow;
     wc.hbrBackground = (HBRUSH)GetStockObject(LTGRAY_BRUSH);
     wc.lpszMenuName  = NULL;
     wc.lpszClassName = g_szClass;
@@ -1945,7 +2446,7 @@ static int RunApp(HINSTANCE hInst, int nCmdShow)
     g_dxClient = g_cBlk * DX_BLK + DX_WINDOW;
     g_dyClient = g_cRow * DY_BLK + DY_WINDOW;
 
-    SetRect(&rc, 0, 0, g_dxClient, g_dyClient);
+    SetRect(&rc, 0, 0, LogToDev(g_dxClient), LogToDev(g_dyClient));
     AdjustWindowRect(&rc, WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
                      (g_fMenu & 1) == 0);
 
@@ -1979,6 +2480,7 @@ static int RunApp(HINSTANCE hInst, int nCmdShow)
     }
 
     FreeBmp();
+    FreeBack();
     KillSound();
     if (g_fUpdateReg)
         WritePreferences();
