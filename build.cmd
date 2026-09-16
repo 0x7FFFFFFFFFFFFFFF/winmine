@@ -94,7 +94,7 @@ link.exe /nologo /SUBSYSTEM:WINDOWS /ENTRY:MinerEntry /NODEFAULTLIB ^
     /OPT:REF /OPT:ICF /MERGE:.rdata=.text /FIXED /DYNAMICBASE:NO ^
     /OUT:winmine.exe build\winmine.obj build\winmine.res ^
     kernel32.lib user32.lib gdi32.lib shell32.lib comctl32.lib ^
-    winmm.lib
+    winmm.lib ole32.lib
 if errorlevel 1 goto failed
 goto check_size
 
@@ -118,7 +118,7 @@ g++.exe -std=c++11 -Os -DUNICODE -D_UNICODE -DMINER_NO_CRT -Wall ^
     -ffunction-sections -nostartfiles -nodefaultlibs ^
     -Wl,--gc-sections -Wl,--subsystem,windows -Wl,-e%~1 -s ^
     -o winmine.exe src\miner.cpp build\winmine.res.o ^
-    -lgdi32 -luser32 -lshell32 -lcomctl32 -lwinmm -lkernel32
+    -lgdi32 -luser32 -lshell32 -lcomctl32 -lwinmm -lole32 -lkernel32
 exit /b 0
 
 rem ====================================================================

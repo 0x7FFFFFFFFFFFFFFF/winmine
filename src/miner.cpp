@@ -24,6 +24,7 @@
 #include <shellapi.h>
 #include <commctrl.h>
 #include <mmsystem.h>
+#include <objbase.h>            /* CoCreateInstance, for ITaskbarList2 */
 
 #include "resource.h"
 
@@ -272,6 +273,39 @@ static HPEN         g_hpenShadow;
 static WCHAR        g_szClass[32];
 static WCHAR        g_szSeconds[32];       /* "%d seconds"            */
 static WCHAR        g_szAnonymous[32];
+
+/*---------------------------------------------------------------------
+    The shell treats any foreground window that covers the whole
+    monitor as a full-screen application and takes the taskbar out of
+    always-on-top for it.  A board bigger than the screen crosses that
+    line every time it is panned, so the taskbar ends up flickering in
+    and out.  ITaskbarList2::MarkFullscreenWindow says "this is not a
+    full-screen app" and settles it.
+
+    The interface is reached through its vtable by hand: that costs one
+    import from ole32 and no C run-time, which is what the build needs.
+  -------------------------------------------------------------------*/
+struct MinerTaskbar;
+
+typedef struct {
+    HRESULT (STDMETHODCALLTYPE *QueryInterface)(struct MinerTaskbar *,
+                                                const GUID *, void **);
+    ULONG   (STDMETHODCALLTYPE *AddRef)(struct MinerTaskbar *);
+    ULONG   (STDMETHODCALLTYPE *Release)(struct MinerTaskbar *);
+    HRESULT (STDMETHODCALLTYPE *HrInit)(struct MinerTaskbar *);
+    HRESULT (STDMETHODCALLTYPE *AddTab)(struct MinerTaskbar *, HWND);
+    HRESULT (STDMETHODCALLTYPE *DeleteTab)(struct MinerTaskbar *, HWND);
+    HRESULT (STDMETHODCALLTYPE *ActivateTab)(struct MinerTaskbar *, HWND);
+    HRESULT (STDMETHODCALLTYPE *SetActiveAlt)(struct MinerTaskbar *, HWND);
+    HRESULT (STDMETHODCALLTYPE *MarkFullscreenWindow)(struct MinerTaskbar *,
+                                                      HWND, BOOL);
+} MinerTaskbarVtbl;
+
+struct MinerTaskbar { MinerTaskbarVtbl *lpVtbl; };
+
+static struct MinerTaskbar *g_ptbl;
+static int                  g_fTaskbarTried;
+static DWORD                g_msTaskbar;
 
 /* --- HtmlHelp, resolved lazily on first use ----------------------- */
 static HMODULE      g_hmodHelp;
@@ -678,6 +712,36 @@ static BOOL FLoadBmp(void)
 static int LogToDev(int v) { return MulDiv(v, g_nZoom, 100); }
 static int DevToLog(int v) { return MulDiv(v, 100, g_nZoom); }
 
+/* Tell the shell this window is not a full-screen application, so it
+   leaves the taskbar on top however far the board spills off screen. */
+static void ClearFullscreenClaim(void)
+{
+    static const GUID clsidTaskbarList =
+        { 0x56FDF344, 0xFD6D, 0x11D0,
+          { 0x95, 0x8A, 0x00, 0x60, 0x97, 0xC9, 0xA0, 0x90 } };
+    static const GUID iidTaskbarList2 =
+        { 0x602D4995, 0xB13A, 0x429B,
+          { 0xA6, 0x6E, 0x19, 0x35, 0xE4, 0x4F, 0x43, 0x17 } };
+
+    if (g_hwnd == NULL)
+        return;
+
+    if (g_ptbl == NULL) {
+        if (g_fTaskbarTried)
+            return;
+        g_fTaskbarTried = 1;
+        CoInitialize(NULL);
+        if (CoCreateInstance(clsidTaskbarList, NULL, CLSCTX_INPROC_SERVER,
+                             iidTaskbarList2, (void **)&g_ptbl) != S_OK ||
+            g_ptbl == NULL) {
+            g_ptbl = NULL;
+            return;
+        }
+        g_ptbl->lpVtbl->HrInit(g_ptbl);
+    }
+    g_ptbl->lpVtbl->MarkFullscreenWindow(g_ptbl, g_hwnd, FALSE);
+}
+
 /* There is no zoom ceiling of principle - a board larger than the
    screen is what the space-bar pan is for.  The only limit is the
    point where the window itself gets too big for the window manager
@@ -1065,21 +1129,26 @@ static void AdjustWindow(UINT wFlags)
     g_dxClient = g_cBlk * DX_BLK + DX_WINDOW;
     g_dyClient = g_cRow * DY_BLK + DY_WINDOW;
 
-    /* pull the window back on screen if it would hang off the edge -
-       but never past the top-left corner, because a field bigger than
-       the screen is meant to be reached with the space-bar pan rather
-       than by losing its title bar off the top */
-    d = LogToDev(g_dxClient) + g_xWindow - DxpScreen(0);
-    if (d > 0) {
-        wFlags |= ADJUST_MOVE;
-        g_xWindow -= d;
-        if (g_xWindow < 0) g_xWindow = 0;
+    /* Pull the window back on screen if it hangs off the edge - but
+       only when it would actually fit.  A board wider or taller than
+       the screen can never be pulled on, and trying would drag it back
+       to the top-left corner every time the zoom changed, throwing away
+       wherever the player had panned to. */
+    if (LogToDev(g_dxClient) <= DxpScreen(0)) {
+        d = LogToDev(g_dxClient) + g_xWindow - DxpScreen(0);
+        if (d > 0) {
+            wFlags |= ADJUST_MOVE;
+            g_xWindow -= d;
+            if (g_xWindow < 0) g_xWindow = 0;
+        }
     }
-    d = LogToDev(g_dyClient) + g_yWindow - DxpScreen(1);
-    if (d > 0) {
-        wFlags |= ADJUST_MOVE;
-        g_yWindow -= d;
-        if (g_yWindow < 0) g_yWindow = 0;
+    if (LogToDev(g_dyClient) <= DxpScreen(1)) {
+        d = LogToDev(g_dyClient) + g_yWindow - DxpScreen(1);
+        if (d > 0) {
+            wFlags |= ADJUST_MOVE;
+            g_yWindow -= d;
+            if (g_yWindow < 0) g_yWindow = 0;
+        }
     }
 
     if (g_fFrozen)
@@ -2231,12 +2300,29 @@ static LRESULT CALLBACK MineWndProc(HWND hwnd, UINT msg, WPARAM wParam,
         /* ctrl + wheel zooms the whole interface */
         if (GET_KEYSTATE_WPARAM(wParam) & MK_CONTROL) {
             int nOld = g_nZoom;
+            int xLog, yLog;
 
             g_nZoom += (GET_WHEEL_DELTA_WPARAM(wParam) > 0) ? ZOOM_STEP
                                                             : -ZOOM_STEP;
             g_nZoom = ClampInt(g_nZoom, ZOOM_MIN, ZoomMax());
-            if (g_nZoom != nOld)
-                AdjustWindow(ADJUST_MOVE | ADJUST_PAINT);
+            if (g_nZoom == nOld)
+                return 0;
+
+            /* Zoom about the pointer: work out which square of the
+               board it is over, then place the window so that same
+               square stays under it afterwards.  Without this the
+               top-left corner stays put and everything the player was
+               looking at slides away off the bottom right.
+               WM_MOUSEWHEEL reports screen coordinates, and
+               g_xWindow/g_yWindow are where the client area starts on
+               screen, so the difference is the offset into the client. */
+            xLog = MulDiv(GET_X_LPARAM(lParam) - g_xWindow, 100, nOld);
+            yLog = MulDiv(GET_Y_LPARAM(lParam) - g_yWindow, 100, nOld);
+            g_xWindow = GET_X_LPARAM(lParam) - MulDiv(xLog, g_nZoom, 100);
+            g_yWindow = GET_Y_LPARAM(lParam) - MulDiv(yLog, g_nZoom, 100);
+
+            AdjustWindow(ADJUST_MOVE | ADJUST_PAINT);
+            ClearFullscreenClaim();
             return 0;
         }
         break;
@@ -2485,6 +2571,7 @@ static LRESULT CALLBACK MineWndProc(HWND hwnd, UINT msg, WPARAM wParam,
         if (g_fPanning) {
             g_fPanning = 0;
             ReleaseCapture();
+            ClearFullscreenClaim();
             return 0;
         }
         if (g_fBlockTrack)
@@ -2494,12 +2581,23 @@ static LRESULT CALLBACK MineWndProc(HWND hwnd, UINT msg, WPARAM wParam,
     case WM_MOUSEMOVE:
         if (g_fPanning) {
             POINT pt;
-            if (GetCursorPos(&pt))
+            if (GetCursorPos(&pt)) {
                 SetWindowPos(hwnd, NULL,
                              g_ptPanOrigin.x + (pt.x - g_ptPanGrab.x),
                              g_ptPanOrigin.y + (pt.y - g_ptPanGrab.y),
                              0, 0,
                              SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                /* The shell re-decides whether this is a full-screen
+                   app every time the window moves, so the claim has to
+                   be renewed as we drag or the taskbar flickers.  It is
+                   a cross-process call, so not on every single mouse
+                   message - a few times a second is enough to keep the
+                   taskbar from ever dropping. */
+                if (GetTickCount() - g_msTaskbar >= 100) {
+                    g_msTaskbar = GetTickCount();
+                    ClearFullscreenClaim();
+                }
+            }
             return 0;
         }
         UpdatePeek(lParam);
@@ -2585,6 +2683,7 @@ static int RunApp(HINSTANCE hInst, int nCmdShow)
 
     SetMenuBar((UINT)g_fMenu);
     StartGame();
+    ClearFullscreenClaim();
 
     ShowWindow(g_hwnd, SW_SHOWNORMAL);
     UpdateWindow(g_hwnd);

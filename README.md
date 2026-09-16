@@ -48,6 +48,13 @@ offscreen surface and then stretched to the window with
 nearest-neighbour sampling, so magnifying gives clean, hard-edged pixels
 rather than a blurred interpolation.
 
+Zooming centres on the **mouse pointer**: whatever square is under the
+cursor stays under it, so you can zoom into a particular corner of a big
+board without losing your place. The window is repositioned to make that
+happen, and a board larger than the screen is deliberately *not* dragged
+back on screen afterwards — that would throw away wherever you had
+panned to.
+
 The game opens at the display's own scale — 1:1 on a normal monitor, 2×
 on a 200% display — so it comes up the size everything else on the
 desktop is drawn at, and sharp, rather than half-size or blurred.
@@ -64,6 +71,15 @@ scaling, in whole pixels. The window also lifts the size limits Windows
 applies by default (`WM_GETMINMAXINFO`), which would otherwise cap it
 near the size of the work area and clip large boards along the bottom
 and right.
+
+One more wrinkle comes with boards bigger than the screen. The shell
+treats any foreground window that covers the whole monitor as a
+full-screen application and takes the taskbar out of always-on-top for
+it — so panning a large board across the screen boundary made the
+taskbar flicker in and out several times a second. The program calls
+`ITaskbarList2::MarkFullscreenWindow(hwnd, FALSE)` to say it is not a
+full-screen application, renewing the claim as the window moves, which
+settles it.
 
 ## Settings and scores
 
