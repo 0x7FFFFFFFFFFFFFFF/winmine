@@ -65,8 +65,8 @@
     zoom - ctrl + wheel, as a percentage of the 1:1 layout
   -------------------------------------------------------------------*/
 #define ZOOM_MIN        25
-#define ZOOM_MAX        400
 #define ZOOM_STEP       25
+#define DXY_ZOOM_MAX    30000   /* largest window edge zoom may ask for */
 
 /*---------------------------------------------------------------------
     the Random button in the custom dialog picks each side from this
@@ -677,6 +677,43 @@ static BOOL FLoadBmp(void)
   =====================================================================*/
 static int LogToDev(int v) { return MulDiv(v, g_nZoom, 100); }
 static int DevToLog(int v) { return MulDiv(v, 100, g_nZoom); }
+
+/* There is no zoom ceiling of principle - a board larger than the
+   screen is what the space-bar pan is for.  The only limit is the
+   point where the window itself gets too big for the window manager
+   to place, so that is what is used. */
+static int ZoomMax(void)
+{
+    int zx, zy;
+
+    if (g_dxClient <= 0 || g_dyClient <= 0)
+        return ZOOM_MIN;
+    zx = MulDiv(DXY_ZOOM_MAX, 100, g_dxClient);
+    zy = MulDiv(DXY_ZOOM_MAX, 100, g_dyClient);
+    if (zy < zx)
+        zx = zy;
+    return (zx < ZOOM_MIN) ? ZOOM_MIN : zx;
+}
+
+/* The zoom the game opens at.  The program asks Windows for real
+   pixels (see the manifest), so on a display running at 200% the
+   artwork would otherwise come up half the size of everything around
+   it.  Starting at the display's own scale puts it back at the size
+   the rest of the desktop is drawn at - and because the scaling is
+   whole-pixel nearest neighbour, it stays sharp instead of being
+   stretched and blurred the way an unaware program would be. */
+static int ZoomForDisplay(void)
+{
+    HWND hwndDesk = GetDesktopWindow();
+    HDC  hdc      = GetDC(hwndDesk);
+    int  dpi      = hdc ? GetDeviceCaps(hdc, LOGPIXELSX) : 96;
+
+    if (hdc)
+        ReleaseDC(hwndDesk, hdc);
+    if (dpi < 96)
+        dpi = 96;
+    return MulDiv(dpi, 100, 96);
+}
 
 static void FreeBack(void)
 {
@@ -2110,6 +2147,23 @@ static LRESULT CALLBACK MineWndProc(HWND hwnd, UINT msg, WPARAM wParam,
         return 0;
     }
 
+    case WM_GETMINMAXINFO: {
+        /* Windows caps a window at roughly the size of the work area
+           unless it is told otherwise, which clips big custom fields
+           along the bottom and right and quietly stops the zoom where
+           it was asked to keep going.  It also refuses to go narrow
+           enough for a small board zoomed right out, which left a bare
+           strip beside the board.  Lift both ends: a board bigger than
+           the screen is what the space-bar pan is for. */
+        LPMINMAXINFO pmmi = (LPMINMAXINFO)lParam;
+
+        pmmi->ptMaxTrackSize.x = DXY_ZOOM_MAX;
+        pmmi->ptMaxTrackSize.y = DXY_ZOOM_MAX;
+        pmmi->ptMinTrackSize.x = 1;
+        pmmi->ptMinTrackSize.y = 1;
+        return 0;
+    }
+
     case WM_MOUSEWHEEL:
         /* ctrl + wheel zooms the whole interface */
         if (GET_KEYSTATE_WPARAM(wParam) & MK_CONTROL) {
@@ -2117,7 +2171,7 @@ static LRESULT CALLBACK MineWndProc(HWND hwnd, UINT msg, WPARAM wParam,
 
             g_nZoom += (GET_WHEEL_DELTA_WPARAM(wParam) > 0) ? ZOOM_STEP
                                                             : -ZOOM_STEP;
-            g_nZoom = ClampInt(g_nZoom, ZOOM_MIN, ZOOM_MAX);
+            g_nZoom = ClampInt(g_nZoom, ZOOM_MIN, ZoomMax());
             if (g_nZoom != nOld)
                 AdjustWindow(ADJUST_MOVE | ADJUST_PAINT);
             return 0;
@@ -2413,6 +2467,7 @@ static int RunApp(HINSTANCE hInst, int nCmdShow)
     RECT      rc;
 
     g_hInst = hInst;
+    g_nZoom = ZoomForDisplay();
     g_hcurArrow = LoadCursorW(NULL, IDC_ARROW);
     g_hcurPan   = LoadCursorW(NULL, IDC_SIZEALL);
     InitPreferences();

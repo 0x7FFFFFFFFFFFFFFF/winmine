@@ -36,12 +36,21 @@ produces `winmine.exe` next to `build.cmd`.
 
 ## Zoom and panning
 
-**Ctrl + mouse wheel** zooms the whole interface, 25% to 400% in 25%
-steps — wheel up to magnify, wheel down to shrink. Everything scales
-together: the artwork, the LED digits and the one-pixel 3D edges. The
-interface is composed once at 1:1 onto an offscreen surface and then
-stretched to the window with nearest-neighbour sampling, so magnifying
-gives clean, hard-edged pixels rather than a blurred interpolation.
+**Ctrl + mouse wheel** zooms the whole interface in 25% steps — wheel up
+to magnify, wheel down to shrink. There is no zoom-in ceiling of
+principle: keep going and the window simply grows past the edge of the
+screen, which is what the pan below is for. The only stop is the point
+where the window gets too large for the window manager to place at all
+(a 30,000 pixel edge — thousands of percent on any normal board).
+Everything scales together: the artwork, the LED digits and the
+one-pixel 3D edges. The interface is composed once at 1:1 onto an
+offscreen surface and then stretched to the window with
+nearest-neighbour sampling, so magnifying gives clean, hard-edged pixels
+rather than a blurred interpolation.
+
+The game opens at the display's own scale — 1:1 on a normal monitor, 2×
+on a 200% display — so it comes up the size everything else on the
+desktop is drawn at, and sharp, rather than half-size or blurred.
 
 **Hold Space and drag with the left button** to slide the window around
 from anywhere in the playfield, like the hand tool in an image editor.
@@ -49,10 +58,12 @@ The cursor changes while Space is held, and dragging never disturbs the
 game underneath. This is what makes very large fields usable: zoom out
 for an overview, then pan to reach the far corners.
 
-The program is marked DPI-aware, so one game pixel is one screen pixel.
-On a high-DPI display that makes the window small but perfectly sharp —
-zoom is what makes it bigger, rather than letting Windows stretch and
-blur it.
+The program is marked DPI-aware, so one game pixel is one screen pixel
+and Windows never stretches and blurs the artwork; the zoom does all the
+scaling, in whole pixels. The window also lifts the size limits Windows
+applies by default (`WM_GETMINMAXINFO`), which would otherwise cap it
+near the size of the work area and clip large boards along the bottom
+and right.
 
 ## Settings and scores
 
