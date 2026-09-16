@@ -59,8 +59,11 @@ The game opens at the display's own scale — 1:1 on a normal monitor, 2×
 on a 200% display — so it comes up the size everything else on the
 desktop is drawn at, and sharp, rather than half-size or blurred.
 
-**Hold Space and drag with the left button** to slide the window around
-from anywhere in the playfield, like the hand tool in an image editor.
+**Hold Space and drag with the left button**, or just **right-drag an
+uncovered square**, to slide the window around from anywhere in the
+playfield, like the hand tool in an image editor. (Right-dragging a
+*covered* square still places a flag, as it always did - only squares
+that are already open pan.)
 The cursor changes while Space is held, and dragging never disturbs the
 game underneath. This is what makes very large fields usable: zoom out
 for an overview, then pan to reach the far corners.
@@ -161,6 +164,13 @@ ring of `0x10` sentinels so the neighbour loops never need edge tests:
   a loss the mines are revealed and wrong flags get a red X;
 * the clock starts on the first button release over the field and stops at 999;
 * minimising pauses the clock and restores it on the way back.
+
+**Holding the left button repeats the click.** After a short pause -
+long enough that an ordinary press-and-release is still a single click -
+it fires every 10 ms, so the button can be held down and swept across
+the board to open or flag a run of squares in one gesture. Releasing
+stops it. (Windows clamps its timers to the system tick, so in practice
+the repeats land every ~16 ms rather than exactly 10.)
 
 F1 opens help, F2 starts a new game.
 

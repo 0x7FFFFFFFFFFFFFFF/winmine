@@ -133,6 +133,16 @@
 #define MINE_FLAT       2
 
 #define ID_TIMER        1
+#define ID_TIMER_AUTO   2       /* the auto-repeat while a button is held */
+
+/*---------------------------------------------------------------------
+    Holding the left button keeps clicking.  The first repeat waits a
+    moment so an ordinary click - press and release - behaves exactly
+    as it always did; past that it fires quickly, so the button can be
+    held down and swept across the board.
+  -------------------------------------------------------------------*/
+#define AUTO_DELAY      300     /* ms before the first repeat          */
+#define AUTO_RATE       10      /* ms between repeats after that       */
 
 /*---------------------------------------------------------------------
     persisted settings
@@ -235,6 +245,7 @@ static int          g_fBackValid;
 /* --- space-bar panning, the hand tool ----------------------------- */
 static int          g_fSpaceDown;
 static int          g_fPanning;
+static int          g_fPanRight;           /* pan begun with button 2 */
 static POINT        g_ptPanGrab;           /* cursor when grabbed     */
 static POINT        g_ptPanOrigin;         /* window origin then      */
 static HCURSOR      g_hcurArrow;
@@ -1739,40 +1750,57 @@ static void TrackMouse(int x, int y)
 }
 
 /* a mouse button came back up over the field */
+/* What a left click does to the square under the cursor.  Shared by
+   the button-up handler and by the auto-repeat while it is held. */
+static void DoClickAction(void)
+{
+    BYTE blk;
+
+    if ((g_fStatus & STATUS_PLAY) == 0)
+        return;
+    if (g_xCur < 1 || g_yCur < 1 || g_xCur > g_cBlk || g_yCur > g_cRow)
+        return;
+
+    if (g_fChord) {
+        StepBlock(g_xCur, g_yCur);
+        return;
+    }
+
+    blk = *PblkAt(g_xCur, g_yCur);
+    if (blk & MASK_VISIT) {
+        /* Clicking an uncovered number does both halves of the
+           bookkeeping: flag the neighbours when they can only be
+           mines, and open them when the flags already add up.  Only
+           one of the two can apply - if the covered squares match the
+           number they all get flagged and there is nothing left to
+           open; if the flags match it, there is nothing left to flag. */
+        FlagSquare(g_xCur, g_yCur);
+        if (g_fStatus & STATUS_PLAY)
+            StepBlock(g_xCur, g_yCur);
+    } else if ((blk & MASK_ICON) != BLK_BOMBFLAG) {
+        StepSquare(g_xCur, g_yCur);
+    }
+}
+
+/* the clock starts on the first square the player actually opens */
+static void StartClockIfIdle(void)
+{
+    if (g_cBlkVisit == 0 && g_cSec == 0) {
+        PlayTune(SOUND_TICK);
+        g_cSec++;
+        DisplayTime();
+        g_fTimer = 1;
+        if (SetTimer(g_hwnd, ID_TIMER, 1000, NULL) == 0)
+            ReportErr(IDS_ERR_TIMER);
+    }
+}
+
 static void DoButton1Up(void)
 {
     if (g_xCur > 0 && g_yCur > 0 && g_xCur <= g_cBlk && g_yCur <= g_cRow) {
-
-        if (g_cBlkVisit == 0 && g_cSec == 0) {
-            PlayTune(SOUND_TICK);
-            g_cSec++;
-            DisplayTime();
-            g_fTimer = 1;
-            if (SetTimer(g_hwnd, ID_TIMER, 1000, NULL) == 0)
-                ReportErr(IDS_ERR_TIMER);
-        }
-
+        StartClockIfIdle();
         if (g_fStatus & STATUS_PLAY) {
-            if (!g_fChord) {
-                BYTE blk = *PblkAt(g_xCur, g_yCur);
-                if (blk & MASK_VISIT) {
-                    /* Clicking an uncovered number does both halves of
-                       the bookkeeping: flag the neighbours when they
-                       can only be mines, and open them when the flags
-                       already add up.  Only one of the two can apply -
-                       if the covered squares match the number they all
-                       get flagged and there is nothing left to open;
-                       if the flags match it, there is nothing left to
-                       flag. */
-                    FlagSquare(g_xCur, g_yCur);
-                    if (g_fStatus & STATUS_PLAY)
-                        StepBlock(g_xCur, g_yCur);
-                } else if ((blk & MASK_ICON) != BLK_BOMBFLAG) {
-                    StepSquare(g_xCur, g_yCur);
-                }
-            } else {
-                StepBlock(g_xCur, g_yCur);
-            }
+            DoClickAction();
         } else {
             g_xCur = -2;
             g_yCur = -2;
@@ -2132,16 +2160,56 @@ static void StartTracking(HWND hwnd, LPARAM lParam)
     g_fBlockTrack = 1;
     DisplayButton(FACE_CAUTION);
     TrackMouse(XFromLp(lParam), YFromLp(lParam));
+    /* arm the auto-repeat; the first one is a while off, so a plain
+       click never turns into two */
+    SetTimer(hwnd, ID_TIMER_AUTO, AUTO_DELAY, NULL);
 }
 
 static void ReleaseTracking(void)
 {
     g_fBlockTrack = 0;
+    KillTimer(g_hwnd, ID_TIMER_AUTO);
     ReleaseCapture();
     if (g_fStatus & STATUS_PLAY)
         DoButton1Up();
     else
         TrackMouse(-2, -2);
+}
+
+/*---------------------------------------------------------------------
+    Panning: space + left-drag, or right-drag on an uncovered square.
+    Both slide the window, which is how a board larger than the screen
+    is got around.
+  -------------------------------------------------------------------*/
+static void BeginPan(HWND hwnd, int fRight)
+{
+    RECT rc;
+
+    GetCursorPos(&g_ptPanGrab);
+    GetWindowRect(hwnd, &rc);
+    g_ptPanOrigin.x = rc.left;
+    g_ptPanOrigin.y = rc.top;
+    g_fPanning  = 1;
+    g_fPanRight = fRight;
+    SetCapture(hwnd);
+    SetCursor(g_hcurPan);
+}
+
+static void EndPan(void)
+{
+    g_fPanning = 0;
+    ReleaseCapture();
+    ClearFullscreenClaim();
+}
+
+/* is the square under this point already uncovered? */
+static BOOL FRevealedAt(int x, int y)
+{
+    if (g_rgBlk == NULL)
+        return FALSE;
+    if (x < 1 || y < 1 || x > g_cBlk || y > g_cRow)
+        return FALSE;
+    return (*PblkAt(x, y) & MASK_VISIT) != 0;
 }
 
 /*---------------------------------------------------------------------
@@ -2337,9 +2405,11 @@ static LRESULT CALLBACK MineWndProc(HWND hwnd, UINT msg, WPARAM wParam,
     case WM_KILLFOCUS:
         g_fSpaceDown = 0;
         g_fCtrlDown  = 0;
-        if (g_fPanning) {
-            g_fPanning = 0;
-            ReleaseCapture();
+        if (g_fPanning)
+            EndPan();
+        if (g_fBlockTrack) {
+            g_fBlockTrack = 0;
+            KillTimer(hwnd, ID_TIMER_AUTO);
         }
         break;
 
@@ -2364,6 +2434,27 @@ static LRESULT CALLBACK MineWndProc(HWND hwnd, UINT msg, WPARAM wParam,
         break;
 
     case WM_TIMER:
+        if (wParam == ID_TIMER_AUTO) {
+            /* The left button is still down: keep clicking wherever
+               the pointer has got to, so it can be swept across the
+               board.  The first repeat came after AUTO_DELAY; from
+               here on it runs at AUTO_RATE. */
+            SetTimer(hwnd, ID_TIMER_AUTO, AUTO_RATE, NULL);
+
+            /* Stop when the button has gone up.  g_fBlockTrack and the
+               capture say that directly - GetKeyState would not, since
+               it reports a snapshot from the last input message this
+               thread took off its own queue. */
+            if (!g_fBlockTrack || GetCapture() != hwnd ||
+                (g_fStatus & STATUS_PLAY) == 0) {
+                KillTimer(hwnd, ID_TIMER_AUTO);
+                return 0;
+            }
+            StartClockIfIdle();
+            DoClickAction();
+            DisplayButton(g_iButtonCur);
+            return 0;
+        }
         DoTimer();
         return 0;
 
@@ -2524,14 +2615,7 @@ static LRESULT CALLBACK MineWndProc(HWND hwnd, UINT msg, WPARAM wParam,
     /*--------------------------------------------------------------*/
     case WM_LBUTTONDOWN:
         if (g_fSpaceDown) {
-            RECT rc;
-            GetCursorPos(&g_ptPanGrab);
-            GetWindowRect(hwnd, &rc);
-            g_ptPanOrigin.x = rc.left;
-            g_ptPanOrigin.y = rc.top;
-            g_fPanning = 1;
-            SetCapture(hwnd);
-            SetCursor(g_hcurPan);
+            BeginPan(hwnd, 0);
             return 0;
         }
         if (g_fIgnoreClick) { g_fIgnoreClick = 0; return 0; }
@@ -2550,6 +2634,17 @@ static LRESULT CALLBACK MineWndProc(HWND hwnd, UINT msg, WPARAM wParam,
 
     case WM_RBUTTONDOWN:
         if (g_fIgnoreClick) { g_fIgnoreClick = 0; return 0; }
+        /* Right-dragging a square that is already uncovered slides the
+           window, the same as space + left-drag.  Right-clicking an
+           uncovered square had no meaning before, so nothing is lost -
+           covered squares still take a flag.  This runs before the
+           game-over check because panning is about looking around, not
+           about playing. */
+        if (!g_fBlockTrack && !g_fPanning &&
+            FRevealedAt(XFromLp(lParam), YFromLp(lParam))) {
+            BeginPan(hwnd, 1);
+            return 0;
+        }
         if ((g_fStatus & STATUS_PLAY) == 0) break;
         if (g_fBlockTrack) {
             TrackMouse(-3, -3);
@@ -2569,9 +2664,8 @@ static LRESULT CALLBACK MineWndProc(HWND hwnd, UINT msg, WPARAM wParam,
     case WM_RBUTTONUP:
     case WM_MBUTTONUP:
         if (g_fPanning) {
-            g_fPanning = 0;
-            ReleaseCapture();
-            ClearFullscreenClaim();
+            if ((msg == WM_RBUTTONUP) == (g_fPanRight != 0))
+                EndPan();
             return 0;
         }
         if (g_fBlockTrack)
