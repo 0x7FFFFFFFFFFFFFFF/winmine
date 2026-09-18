@@ -155,8 +155,8 @@ ring of `0x10` sentinels so the neighbour loops never need edge tests:
 * chording (both buttons, middle button, or shift + left) only fires when the
   flag count around the cell equals its number, and pressing in shows the whole
   3×3 block;
-* left-clicking an uncovered number flags or opens its neighbours, depending on
-  what already adds up — see below;
+* left-clicking anywhere in an uncovered area flags or opens along the whole
+  edge of that area, depending on what already adds up — see below;
 * right-click cycles blank → flag → `?` → blank, and skips `?` when **Marks**
   is off; only the flag transitions move the mine counter;
 * placing the last flag when every safe cell is already open wins the game;
@@ -174,10 +174,21 @@ the repeats land every ~16 ms rather than exactly 10.)
 
 F1 opens help, F2 starts a new game.
 
-### Clicking a number
+### Clicking an uncovered square
 
-**Left-click an uncovered number** and it does whichever piece of bookkeeping
-has become obvious:
+**Left-click anywhere in an uncovered area** and the whole edge of that area is
+worked at once: every uncovered square in it that still has a covered
+neighbour is treated exactly as if you had clicked that square by hand. One
+click therefore clears as much ground as the area's edge allows, and clicking
+the same spot again takes the next pass — it works the edge once per click
+rather than solving the board outright.
+
+Only the *contiguous* area you clicked in is touched; a separate uncovered
+patch elsewhere is left alone. Clicking a single square that happens to sit on
+its own is just the one-square case of this.
+
+What each square on the edge does is whichever piece of bookkeeping has become
+obvious:
 
 * if the squares still **covered** around it number exactly what the square
   says, every one of them must be a mine, so they are all **flagged** at once.
@@ -187,10 +198,17 @@ has become obvious:
   neighbours cannot be mines, so they are all **opened** — a flood fill from
   each, exactly as chording does.
 
-Only one of the two can ever apply. If the covered squares match the number
-they all get flagged and there is nothing left to open; if the flags match it,
-there is nothing left to flag. When neither matches, the click does nothing at
-all, and clicking a square whose work is already done is a no-op.
+Only one of the two can ever apply to a given square. If its covered squares
+match the number they all get flagged and there is nothing left to open; if its
+flags match it, there is nothing left to flag. Squares where neither matches
+are left alone, so a click on an area with no obvious work does nothing.
+
+The sweep is done in two passes over the board: the first floods the contiguous
+uncovered area and marks it using a spare bit of each square's byte, and the
+second walks the board acting on the marked squares and clearing the marks as
+it goes — so the marks never outlive the call, even if the game ends part way
+through. Only squares marked by the first pass are acted on, which is what
+keeps one click to one pass over the edge.
 
 The opening half is the same operation as chording — and carries the same risk:
 if a flag is in the wrong place, opening its neighbours steps on a mine and

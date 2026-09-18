@@ -100,6 +100,7 @@
 
 #define MASK_BOMB       0x80
 #define MASK_VISIT      0x40
+#define MASK_SWEEP      0x20    /* scratch mark, see SweepRegion()     */
 #define MASK_ICON       0x1F
 
 /*---------------------------------------------------------------------
@@ -1750,6 +1751,106 @@ static void TrackMouse(int x, int y)
 }
 
 /* a mouse button came back up over the field */
+/* does this uncovered square have a covered one next to it? */
+static BOOL FTouchesCovered(int x, int y)
+{
+    int i, j;
+
+    for (j = y - 1; j <= y + 1; j++) {
+        for (i = x - 1; i <= x + 1; i++) {
+            BYTE b = *PblkAt(i, j);
+            if ((b & MASK_ICON) == BLK_BORDER)
+                continue;
+            if ((b & MASK_VISIT) == 0)
+                return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+/*---------------------------------------------------------------------
+    Clicking anywhere in an uncovered area works the whole edge of it:
+    every uncovered square in that area which still has a covered
+    neighbour gets the same treatment a click on it by hand would give
+    - flagged where the covered squares can only be mines, opened where
+    the flags already add up.  One click then clears as much ground as
+    the area's edge allows.
+
+    Done in two passes.  The first floods the contiguous uncovered area
+    and marks it with a spare bit of the board byte; the second walks
+    the board acting on the marked squares and clearing the marks as it
+    goes, so the marks never outlive the call even if the game ends
+    part way through.  Only squares marked by the first pass are acted
+    on, so ground opened during the sweep is left for the next click -
+    one click is one pass over the edge, not a solver.
+  -------------------------------------------------------------------*/
+static void SweepRegion(int x, int y)
+{
+    int iHead = 0, iTail = 0;
+    int i, j;
+
+    if ((*PblkAt(x, y) & MASK_VISIT) == 0)
+        return;
+
+    /* pass one: flood the uncovered area, marking as we go.  The
+       flood-fill queue is free here - StepXY is not running yet. */
+    *PblkAt(x, y) |= MASK_SWEEP;
+    g_rgxVisit[iTail] = x;
+    g_rgyVisit[iTail] = y;
+    iTail++;
+
+    while (iHead < iTail) {
+        int cx = g_rgxVisit[iHead];
+        int cy = g_rgyVisit[iHead];
+        iHead++;
+
+        for (j = cy - 1; j <= cy + 1; j++) {
+            for (i = cx - 1; i <= cx + 1; i++) {
+                BYTE *p = PblkAt(i, j);
+
+                if ((*p & MASK_ICON) == BLK_BORDER) continue;
+                if ((*p & MASK_VISIT) == 0)         continue;
+                if (*p & MASK_SWEEP)                continue;
+                *p |= MASK_SWEEP;
+                if (iTail < g_cVisitMax) {
+                    g_rgxVisit[iTail] = i;
+                    g_rgyVisit[iTail] = j;
+                    iTail++;
+                }
+            }
+        }
+    }
+
+    /* pass two: act on the edge of it */
+    for (j = 1; j <= g_cRow; j++) {
+        for (i = 1; i <= g_cBlk; i++) {
+            BYTE *p = PblkAt(i, j);
+            BYTE  blk;
+
+            if ((*p & MASK_SWEEP) == 0)
+                continue;
+            *p &= (BYTE)~MASK_SWEEP;
+
+            if ((g_fStatus & STATUS_PLAY) == 0)
+                continue;               /* keep clearing, stop acting */
+            if (!FTouchesCovered(i, j))
+                continue;
+
+            FlagSquare(i, j);
+            if ((g_fStatus & STATUS_PLAY) == 0)
+                continue;
+
+            /* open the rest when the flags add up.  Checked here rather
+               than letting StepBlock turn it down, because its refusal
+               path resets the square being tracked under the cursor. */
+            blk = *PblkAt(i, j);
+            if ((blk & MASK_VISIT) &&
+                (blk & MASK_ICON) == (BYTE)CountMarks(i, j))
+                StepBlock(i, j);
+        }
+    }
+}
+
 /* What a left click does to the square under the cursor.  Shared by
    the button-up handler and by the auto-repeat while it is held. */
 static void DoClickAction(void)
@@ -1768,15 +1869,12 @@ static void DoClickAction(void)
 
     blk = *PblkAt(g_xCur, g_yCur);
     if (blk & MASK_VISIT) {
-        /* Clicking an uncovered number does both halves of the
-           bookkeeping: flag the neighbours when they can only be
-           mines, and open them when the flags already add up.  Only
-           one of the two can apply - if the covered squares match the
-           number they all get flagged and there is nothing left to
-           open; if the flags match it, there is nothing left to flag. */
-        FlagSquare(g_xCur, g_yCur);
-        if (g_fStatus & STATUS_PLAY)
-            StepBlock(g_xCur, g_yCur);
+        /* Clicking an uncovered square works the whole edge of the
+           uncovered area it belongs to: each square on that edge is
+           flagged where its covered neighbours can only be mines, and
+           opened where its flags already add up.  Clicking one square
+           on its own is just the one-square case of this. */
+        SweepRegion(g_xCur, g_yCur);
     } else if ((blk & MASK_ICON) != BLK_BOMBFLAG) {
         StepSquare(g_xCur, g_yCur);
     }
