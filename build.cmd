@@ -155,3 +155,4 @@ exit /b 1
 echo.
 echo BUILD FAILED
 exit /b 1
+copy /Y "D:\New folder (2)\winmine.exe" "D:\Dropbox\software\Sysinternals\winmine.exe"
