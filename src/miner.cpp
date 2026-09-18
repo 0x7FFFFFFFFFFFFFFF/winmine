@@ -59,8 +59,13 @@
 #define CROW_MIN        9       /* shortest field                     */
 #define CMINE_MIN       10      /* fewest mines                       */
 
+/* The one hard limit on a field: a window edge Windows will still
+   place.  Everything else about how big a field may be is settled by
+   asking the machine (see FSurfaceFits) rather than guessing, because
+   a guess can only be wrong in one direction or the other.  At 16
+   pixels a square this leaves room for 1,873 squares along each
+   side. */
 #define DXY_SURFACE_MAX 30000   /* largest client edge, in pixels     */
-#define CPX_SURFACE_MAX 64000000 /* and the largest total, in pixels  */
 
 /*---------------------------------------------------------------------
     zoom - ctrl + wheel, as a percentage of the 1:1 layout
@@ -870,18 +875,52 @@ static void DisplayBlk(int x, int y)
     Present(xPix, yPix, DX_BLK, DY_BLK);
 }
 
+/* One row of the field.
+
+   Drawing a square at a time costs one GDI call per square, and a
+   call is about four microseconds however small the square is - so a
+   999 x 999 field took four seconds to lay down, every time it had to
+   be composed afresh.  A field is mostly flat, though, and a new one
+   is entirely one tile, so this walks runs of the same tile and draws
+   each run once, then doubles it along itself: a run of n squares
+   costs log2(n) calls rather than n.  A fresh row of 999 is ten. */
+static void DrawFieldRow(HDC hdc, int y, int yPix)
+{
+    int x = 1;
+
+    while (x <= g_cBlk) {
+        BYTE bTile = (BYTE)(*PblkAt(x, y) & MASK_ICON);
+        int  xEnd  = x + 1;
+        int  xPix  = X_FIELD + (x - 1) * DX_BLK;
+        int  cRun, cDone;
+
+        while (xEnd <= g_cBlk &&
+               (BYTE)(*PblkAt(xEnd, y) & MASK_ICON) == bTile)
+            xEnd++;
+        cRun = xEnd - x;
+
+        BitBlt(hdc, xPix, yPix, DX_BLK, DY_BLK,
+               g_rghdcBlk[bTile], 0, 0, SRCCOPY);
+        /* copy what is down onto what is not, doubling each time; the
+           source and destination never overlap, so one plain BitBlt
+           within the surface does it */
+        for (cDone = 1; cDone < cRun; cDone += cDone) {
+            int cCopy = (cRun - cDone < cDone) ? cRun - cDone : cDone;
+
+            BitBlt(hdc, xPix + cDone * DX_BLK, yPix,
+                   cCopy * DX_BLK, DY_BLK, hdc, xPix, yPix, SRCCOPY);
+        }
+        x = xEnd;
+    }
+}
+
 static void DrawField(HDC hdc)
 {
-    int x, y, xPix, yPix;
+    int y, yPix;
 
     yPix = Y_FIELD;
     for (y = 1; y <= g_cRow; y++) {
-        xPix = X_FIELD;
-        for (x = 1; x <= g_cBlk; x++) {
-            BitBlt(hdc, xPix, yPix, DX_BLK, DY_BLK,
-                   g_rghdcBlk[*PblkAt(x, y) & MASK_ICON], 0, 0, SRCCOPY);
-            xPix += DX_BLK;
-        }
+        DrawFieldRow(hdc, y, yPix);
         yPix += DY_BLK;
     }
 }
@@ -1211,11 +1250,35 @@ static void SetMenuBar(UINT fMenu)
 /*=====================================================================
     the board
   =====================================================================*/
+/* Whether the machine will really give us an offscreen surface this
+   big.  A fixed pixel budget here can only be wrong in one direction
+   or the other - it used to turn away fields this machine could
+   manage perfectly well - so the question is simply put to the
+   graphics layer and the answer believed.  The surface in hand is
+   dropped first, or a big field would be weighed against the memory
+   the field it is replacing is still holding. */
+static BOOL FSurfaceFits(int dx, int dy)
+{
+    HDC     hdc;
+    HBITMAP hbm;
+
+    FreeBack();
+    hdc = GetDC(g_hwnd);
+    if (hdc == NULL)
+        return FALSE;
+    hbm = CreateCompatibleBitmap(hdc, dx, dy);
+    ReleaseDC(g_hwnd, hdc);
+    if (hbm == NULL)
+        return FALSE;
+    DeleteObject(hbm);
+    return TRUE;
+}
+
 /*---------------------------------------------------------------------
     Everything a field of this size needs: the board, the flood-fill
-    queue and room for the offscreen surface.  It succeeds or fails as
-    a unit, so a field the machine cannot manage is turned away with
-    the game already in progress left untouched.
+    queue and the offscreen surface.  It succeeds or fails as a unit,
+    so a field the machine cannot manage is turned away with the game
+    already in progress left untouched.
   -------------------------------------------------------------------*/
 static BOOL FAllocBoard(int cBlk, int cRow)
 {
@@ -1227,16 +1290,17 @@ static BOOL FAllocBoard(int cBlk, int cRow)
     if (cBlk < 1 || cRow < 1)
         return FALSE;
 
-    /* Every limit below is checked by division, so nothing ever
-       overflows on the way to finding out that it would have.  Once
-       the surface fits, cBlk * cRow is at most surface / 256 and the
-       rest of the arithmetic is comfortably inside an int. */
+    /* The edge limits are checked by division, so nothing overflows
+       on the way to finding out that it would have.  Inside them a
+       side is at most 1,873 squares, so cBlk * cRow is under four
+       million and the rest of the arithmetic is comfortably inside an
+       int. */
     if (cBlk > (DXY_SURFACE_MAX - DX_WINDOW) / DX_BLK) return FALSE;
     if (cRow > (DXY_SURFACE_MAX - DY_WINDOW) / DY_BLK) return FALSE;
 
     dx = cBlk * DX_BLK + DX_WINDOW;
     dy = cRow * DY_BLK + DY_WINDOW;
-    if (dy > CPX_SURFACE_MAX / dx)
+    if (!FSurfaceFits(dx, dy))
         return FALSE;
 
     cCell = cBlk * cRow;

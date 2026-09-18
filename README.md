@@ -129,7 +129,17 @@ so the common case is a plain `BitBlt`.
 
 The client area is `width*16 + 24` by `height*16 + 67`. Cell *(x, y)* is
 blitted at `(x*16 - 4, y*16 + 39)`, and a click at client *(px, py)* maps back
-to `((px + 4) >> 4, (py - 0x27) >> 4)`. The 3D edges all come from one routine
+to `((px + 4) >> 4, (py - 0x27) >> 4)`.
+
+A square at a time is fine for a normal board and hopeless for a huge
+one: a GDI call costs a few microseconds whatever it draws, so a
+999 × 999 field took four seconds every time it had to be composed
+afresh. A field is mostly flat, though — a new one is entirely the same
+tile — so each row is drawn as **runs of the same tile**: the run is
+drawn once and then doubled along itself, which costs `log2(n)` calls
+for a run of `n` squares instead of `n`. A fresh row of 999 squares
+takes ten calls rather than 999, and the same field now composes in
+about 250 ms. The output is identical either way, down to the pixel. The 3D edges all come from one routine
 that walks `cThick` nested rectangles, using `R2_WHITE` for the highlight and a
 grey (black, in mono) pen with `R2_COPYPEN` for the shadow.
 
@@ -218,10 +228,22 @@ ends the game, just as a chord would.
 
 **Game ▸ Custom** takes any height, width and mine count you type — there
 is no upper limit in the dialog. The board, the flood-fill queue and the
-offscreen surface are all allocated to fit, and a field too large for the
-machine is refused with an out-of-memory message, leaving the game you
-were playing untouched. In practice that ceiling is around 250,000
-squares (a 500 × 500 field).
+offscreen surface are all allocated to fit.
+
+There is exactly one fixed limit: a window edge Windows will still place,
+30,000 pixels, which at 16 pixels a square leaves room for **1,873
+squares along each side**. Everything else is settled by asking the
+machine rather than guessing — the program tries to take the offscreen
+surface the field would need, and only if that is actually refused does
+it turn the field down, with an out-of-memory message, leaving the game
+you were playing untouched. A fixed pixel budget in its place could only
+ever be wrong in one direction or the other, and used to turn away
+fields that were perfectly buildable.
+
+What that comes to depends on the machine. A 999 × 999 field — 998,001
+squares, a client area of 16,008 × 16,051 — opens in about a fifth of a
+second on a normal desktop, and roughly twice that size is where the
+graphics layer starts saying no.
 
 Two details fall out of large fields:
 
