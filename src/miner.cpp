@@ -2239,7 +2239,12 @@ static void GoToSquare(int x, int y)
         xScr + cx > dxScreen || yScr + cy > dyScreen) {
         g_xWindow = (dxScreen - cx) / 2 - xDev;
         g_yWindow = (dyScreen - cy) / 2 - yDev;
-        MoveToClient(FALSE);
+        /* Repaint: a window bigger than the screen keeps only what it
+           can when it moves and leaves the rest invalid, so moving it
+           without asking for a repaint leaves the newly uncovered part
+           of the board blank - which, after a jump right across a
+           large field, is most of what the player can see. */
+        MoveToClient(TRUE);
         ClearFullscreenClaim();
         xScr = g_xWindow + xDev;
         yScr = g_yWindow + yDev;
@@ -2250,10 +2255,17 @@ static void GoToSquare(int x, int y)
 /* Two clicks on the same square, close enough together to be one
    gesture.  Worked out here rather than with WM_LBUTTONDBLCLK so that
    the run of button messages the rest of the game reads stays exactly
-   as it was. */
+   as it was.
+
+   The times come from the messages, not the clock: what the first
+   click set off may take a while - a sweep along the edge of a
+   million opened squares is not quick - and timing from when that
+   finished would make the pair look far apart and the double-click go
+   unnoticed.  GetMessageTime is when the click actually happened, so
+   how long the game spent on it does not come into it. */
 static BOOL FSecondClick(int x, int y)
 {
-    DWORD tm = GetTickCount();
+    DWORD tm = (DWORD)GetMessageTime();
     BOOL  f  = (x == g_xLastClick && y == g_yLastClick &&
                 tm - g_tmLastClick <= GetDoubleClickTime());
 
