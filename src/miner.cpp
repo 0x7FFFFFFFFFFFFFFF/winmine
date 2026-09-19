@@ -96,7 +96,6 @@
     window in device pixels, so it stays four screen pixels whatever
     the zoom is doing to everything else.
   -------------------------------------------------------------------*/
-#define PEEK_EDGE       5       /* screen pixels, never scaled        */
 
 /*---------------------------------------------------------------------
     tile indices inside the 16-tile block bitmap
@@ -2724,28 +2723,23 @@ static void DoXyzzy(WPARAM wParam, LPARAM lParam)
     device pixels, deliberately outside the zoomed surface, so it stays
     exactly four screen pixels however far the interface is zoomed in.
   -------------------------------------------------------------------*/
-/* Where the block goes: the bottom-left corner of the square under
-   the cursor, in real screen pixels.  It used to sit in the corner of
-   the window, which was fine while the window was small - but a board
-   can be far wider than the screen, and then the corner of the window
-   is off the edge of it and the answer is somewhere the player cannot
-   see.  Following the cursor keeps it under their eye wherever on the
-   board they are.  The size stays in device pixels, so the block is
-   the same five-by-five patch of the monitor at any zoom. */
+/* Where the block goes: over the whole of the square under the
+   cursor.  It used to sit in the corner of the window, which was fine
+   while the window was small - but a board can be far wider than the
+   screen, and then the corner of the window is off the edge of it and
+   the answer is somewhere the player cannot see.  Covering the square
+   itself keeps it under their eye wherever on the board they are, and
+   at whatever zoom: the block is the square, so it grows and shrinks
+   with it. */
 static BOOL FPeekRect(LPRECT prc, int x, int y)
 {
-    int xDev, yDev;
-
     if (g_hwnd == NULL || x < 1 || y < 1 || x > g_cBlk || y > g_cRow)
         return FALSE;
 
-    xDev = LogToDev(x * DX_BLK - 4);            /* the square's left  */
-    yDev = LogToDev(y * DY_BLK + 39 + DY_BLK);  /* and its bottom     */
-
-    prc->left   = xDev;
-    prc->right  = xDev + PEEK_EDGE;
-    prc->bottom = yDev;
-    prc->top    = yDev - PEEK_EDGE;
+    prc->left   = LogToDev(x * DX_BLK - 4);
+    prc->top    = LogToDev(y * DY_BLK + 39);
+    prc->right  = LogToDev(x * DX_BLK - 4 + DX_BLK);
+    prc->bottom = LogToDev(y * DY_BLK + 39 + DY_BLK);
     return TRUE;
 }
 

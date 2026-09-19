@@ -354,18 +354,16 @@ block answers the same question XYZZY does about the square under the
 cursor: **red** for a mine, **green** for clear. Press Ctrl + T again to
 turn it off.
 
-The block sits in the **bottom-left corner of the square the cursor is
-on**, and follows the cursor around the board. It used to live in the
-bottom-left corner of the window, which was fine while the window was
-small — but a board can be far wider than the screen, and then the
-corner of the window is off the edge of it and the answer is somewhere
-the player cannot see.
+The block **covers the whole of the square the cursor is on**, and
+follows the cursor around the board. It used to live in the bottom-left
+corner of the window, which was fine while the window was small — but a
+board can be far wider than the screen, and then the corner of the
+window is off the edge of it and the answer is somewhere the player
+cannot see.
 
-It is painted straight onto the window in device pixels rather than
-onto the zoomed surface, so it stays a **5 × 5 square of real screen
-pixels** however far the interface is zoomed in. Moving to another
-square lifts it off the old one first, putting back whatever the board
-had underneath.
+Because the block is the square, it grows and shrinks with the zoom
+like everything else. Moving to another square lifts it off the old one
+first, putting back whatever the board had underneath.
 
 ## Building
 
