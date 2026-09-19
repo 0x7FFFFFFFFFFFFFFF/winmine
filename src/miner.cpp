@@ -279,6 +279,11 @@ static int          g_fCtrlDown;           /* tracked, not polled     */
 static int          g_fPeek;
 static int          g_xPeek = -1;
 static int          g_yPeek = -1;
+/* --- double-click, to walk to the next covered square ------------- */
+static DWORD        g_tmLastClick;
+static int          g_xLastClick = -1;
+static int          g_yLastClick = -1;
+
 static int          g_fPeekOn;             /* the block is painted    */
 static RECT         g_rcPeekOn;            /* and this is where       */
 
@@ -1306,6 +1311,14 @@ static void DisplayScreen(void)
 #define ADJUST_SHOW     1
 #define ADJUST_MOVE     2
 #define ADJUST_PAINT    4
+/* Repaint, but the interface itself has not changed - only the size
+   it is being shown at.  The offscreen surface is drawn entirely in
+   1:1 coordinates and the zoom is applied on the way out of it, so a
+   zoom does not touch its contents and there is nothing to redraw:
+   throwing it away and composing it again cost a quarter of a second
+   a notch on a million-square field, for a picture identical to the
+   one already in hand. */
+#define ADJUST_RESCALE  8
 
 /* TRUE when the menu bar has wrapped onto a second line */
 static BOOL FMenuWrapped(void)
@@ -1321,7 +1334,10 @@ static BOOL FMenuWrapped(void)
 
 /* place the frame so that the client area lands exactly on
    (g_xWindow, g_yWindow) and measures g_dxClient x g_dyClient */
-static void MoveToClient(void)
+/* fRepaint is for callers that are not going to invalidate the window
+   themselves; when one is about to, letting MoveWindow repaint as
+   well means painting the whole thing twice */
+static void MoveToClient(BOOL fRepaint)
 {
     RECT  rc;
     DWORD dwStyle = (DWORD)GetWindowLongPtrW(g_hwnd, GWL_STYLE);
@@ -1329,12 +1345,13 @@ static void MoveToClient(void)
     SetRect(&rc, 0, 0, LogToDev(g_dxClient), LogToDev(g_dyClient));
     AdjustWindowRect(&rc, dwStyle, GetMenu(g_hwnd) != NULL);
     MoveWindow(g_hwnd, g_xWindow + rc.left, g_yWindow + rc.top,
-               rc.right - rc.left, rc.bottom - rc.top, TRUE);
+               rc.right - rc.left, rc.bottom - rc.top, fRepaint);
 }
 
 static void AdjustWindow(UINT wFlags)
 {
     BOOL fWrapCheck = FALSE;
+    BOOL fOwnPaint;
     int  d;
 
     if (g_hwnd == NULL)
@@ -1384,18 +1401,28 @@ static void AdjustWindow(UINT wFlags)
     if (g_fFrozen)
         return;
 
+    /* whether this call is going to invalidate the window afterwards */
+    fOwnPaint = (wFlags & (ADJUST_PAINT | ADJUST_RESCALE)) != 0;
+
     if (wFlags & ADJUST_MOVE)
-        MoveToClient();
+        MoveToClient(!fOwnPaint);
 
     /* a wider window may have un-wrapped the menu bar */
     if (fWrapCheck && !FMenuWrapped()) {
         g_dyAdjust -= g_dyMenu;
-        MoveToClient();
+        MoveToClient(!fOwnPaint);
     }
 
-    if (wFlags & ADJUST_PAINT) {
-        g_fBackValid = 0;
-        InvalidateRect(g_hwnd, NULL, TRUE);
+    if (wFlags & (ADJUST_PAINT | ADJUST_RESCALE)) {
+        if (wFlags & ADJUST_PAINT)
+            g_fBackValid = 0;
+        /* No erase: every pixel of the update region is about to be
+           copied over from the surface, so filling the client with
+           the background brush first is a second pass over the whole
+           window for nothing - and on a large board that is the most
+           expensive thing in the repaint, as well as what makes it
+           flicker. */
+        InvalidateRect(g_hwnd, NULL, FALSE);
     }
 }
 
@@ -2147,12 +2174,110 @@ static void StartClockIfIdle(void)
     }
 }
 
+/*---------------------------------------------------------------------
+    Double-click an uncovered square: go to the next covered one.
+
+    On a field of a million squares the last few that are still covered
+    can be anywhere, and hunting for them by dragging the window about
+    is miserable.  A double-click on a square that is already uncovered
+    goes to the next covered one in reading order, wrapping round at
+    the end, and brings both the window and the pointer to it.
+
+    Only uncovered squares do this, so it never gets in the way of
+    play: double-clicking a covered square opens it, exactly as two
+    ordinary clicks always did.  That also means the pointer ends the
+    jump sitting on a covered square - to go on to the one after, click
+    an uncovered square nearby.
+
+    Squares already carrying a flag are passed over: they are covered,
+    but the player has said what they think is under them, and stopping
+    at each of them would mean wading through every mine on the board
+    to reach anything still undecided.
+  -------------------------------------------------------------------*/
+static BOOL FNextCovered(int xFrom, int yFrom, int *px, int *py)
+{
+    int x = xFrom, y = yFrom;
+    int n, cCell = g_cBlk * g_cRow;
+
+    if (g_rgBlk == NULL)
+        return FALSE;
+
+    for (n = 0; n < cCell; n++) {
+        BYTE blk;
+
+        if (++x > g_cBlk) {
+            x = 1;
+            if (++y > g_cRow)
+                y = 1;
+        }
+        blk = *PblkAt(x, y);
+        if ((blk & MASK_VISIT) == 0 && (blk & MASK_ICON) != BLK_BOMBFLAG) {
+            *px = x;
+            *py = y;
+            return TRUE;
+        }
+    }
+    return FALSE;               /* nothing left to go to */
+}
+
+/* Bring a square into view and put the pointer on it.  The window is
+   only moved when the square is not already on screen - there is no
+   sense throwing away where the player had got to when what they
+   asked for is in front of them - and when it is moved the square is
+   centred, so there is board visible all round it. */
+static void GoToSquare(int x, int y)
+{
+    int xDev = LogToDev(x * DX_BLK - 4);
+    int yDev = LogToDev(y * DY_BLK + 39);
+    int cx   = LogToDev(x * DX_BLK + 12) - xDev;
+    int cy   = LogToDev(y * DY_BLK + 55) - yDev;
+    int dxScreen = DxpScreen(0);
+    int dyScreen = DxpScreen(1);
+    int xScr = g_xWindow + xDev;
+    int yScr = g_yWindow + yDev;
+
+    if (xScr < 0 || yScr < 0 ||
+        xScr + cx > dxScreen || yScr + cy > dyScreen) {
+        g_xWindow = (dxScreen - cx) / 2 - xDev;
+        g_yWindow = (dyScreen - cy) / 2 - yDev;
+        MoveToClient(FALSE);
+        ClearFullscreenClaim();
+        xScr = g_xWindow + xDev;
+        yScr = g_yWindow + yDev;
+    }
+    SetCursorPos(xScr + cx / 2, yScr + cy / 2);
+}
+
+/* Two clicks on the same square, close enough together to be one
+   gesture.  Worked out here rather than with WM_LBUTTONDBLCLK so that
+   the run of button messages the rest of the game reads stays exactly
+   as it was. */
+static BOOL FSecondClick(int x, int y)
+{
+    DWORD tm = GetTickCount();
+    BOOL  f  = (x == g_xLastClick && y == g_yLastClick &&
+                tm - g_tmLastClick <= GetDoubleClickTime());
+
+    g_tmLastClick = tm;
+    /* a detected pair ends there, so three clicks are not two pairs */
+    g_xLastClick  = f ? -1 : x;
+    g_yLastClick  = f ? -1 : y;
+    return f;
+}
+
 static void DoButton1Up(void)
 {
     if (g_xCur > 0 && g_yCur > 0 && g_xCur <= g_cBlk && g_yCur <= g_cRow) {
         StartClockIfIdle();
         if (g_fStatus & STATUS_PLAY) {
-            DoClickAction();
+            int xNext, yNext;
+
+            if (FSecondClick(g_xCur, g_yCur) &&
+                (*PblkAt(g_xCur, g_yCur) & MASK_VISIT) &&
+                FNextCovered(g_xCur, g_yCur, &xNext, &yNext))
+                GoToSquare(xNext, yNext);
+            else
+                DoClickAction();
         } else {
             g_xCur = -2;
             g_yCur = -2;
@@ -2790,12 +2915,31 @@ static LRESULT CALLBACK MineWndProc(HWND hwnd, UINT msg, WPARAM wParam,
     case WM_MOUSEWHEEL:
         /* ctrl + wheel zooms the whole interface */
         if (GET_KEYSTATE_WPARAM(wParam) & MK_CONTROL) {
-            int nOld = g_nZoom;
+            int nOld  = g_nZoom;
+            int nStep = (GET_WHEEL_DELTA_WPARAM(wParam) > 0) ? ZOOM_STEP
+                                                             : -ZOOM_STEP;
             int xLog, yLog;
+            MSG msgT;
 
-            g_nZoom += (GET_WHEEL_DELTA_WPARAM(wParam) > 0) ? ZOOM_STEP
-                                                            : -ZOOM_STEP;
-            g_nZoom = ClampInt(g_nZoom, ZOOM_MIN, ZoomMax());
+            /* Take every wheel notch already queued and apply them as
+               one change.  Resizing a window the size of a large
+               board is the expensive part of a zoom, and doing it
+               once per notch meant a flick of the wheel queued up
+               seconds of work - during which the wheel appears to do
+               nothing at all.  Notches without ctrl are left where
+               they are; they are not ours. */
+            while (PeekMessageW(&msgT, hwnd, WM_MOUSEWHEEL, WM_MOUSEWHEEL,
+                                PM_NOREMOVE)) {
+                if ((GET_KEYSTATE_WPARAM(msgT.wParam) & MK_CONTROL) == 0)
+                    break;
+                PeekMessageW(&msgT, hwnd, WM_MOUSEWHEEL, WM_MOUSEWHEEL,
+                             PM_REMOVE);
+                nStep += (GET_WHEEL_DELTA_WPARAM(msgT.wParam) > 0)
+                         ? ZOOM_STEP : -ZOOM_STEP;
+                lParam = msgT.lParam;   /* anchor on the latest pointer */
+            }
+
+            g_nZoom = ClampInt(nOld + nStep, ZOOM_MIN, ZoomMax());
             if (g_nZoom == nOld)
                 return 0;
 
@@ -2812,7 +2956,7 @@ static LRESULT CALLBACK MineWndProc(HWND hwnd, UINT msg, WPARAM wParam,
             g_xWindow = GET_X_LPARAM(lParam) - MulDiv(xLog, g_nZoom, 100);
             g_yWindow = GET_Y_LPARAM(lParam) - MulDiv(yLog, g_nZoom, 100);
 
-            AdjustWindow(ADJUST_MOVE | ADJUST_PAINT);
+            AdjustWindow(ADJUST_MOVE | ADJUST_RESCALE);
             ClearFullscreenClaim();
             return 0;
         }

@@ -172,7 +172,22 @@ play than composing does:
   1:1 the window used to be redrawn whole on any repaint, so putting
   back one square cost a stretch of the entire interface — about a
   quarter of a second on a large field. Only the part that actually
-  needs repainting is copied now, which is under a millisecond. The 3D edges all come from one routine
+  needs repainting is copied now, which is under a millisecond.
+* **zooming does not redraw anything.** The offscreen surface is drawn
+  entirely in 1:1 coordinates and the zoom is applied on the way out of
+  it, so changing the zoom cannot change what is on the surface — yet a
+  zoom used to throw it away and compose it again, a quarter of a second
+  a notch on a million-square field, for a picture identical to the one
+  already in hand. A zoom now only resizes the window and copies. The
+  background is no longer erased ahead of a repaint either, which was a
+  second pass over the whole window for pixels that were about to be
+  overwritten, and was what made a zoom flicker.
+* **wheel notches are coalesced.** Resizing a window the size of a large
+  board is the one genuinely expensive part of a zoom, and doing it once
+  per notch meant a flick of the wheel queued up seconds of work —
+  during which the wheel appears to do nothing at all. Every notch
+  already waiting is taken and applied as one change. A five-notch flick
+  on a 999 × 999 field went from **500 ms to about 15**. The 3D edges all come from one routine
 that walks `cThick` nested rectangles, using `R2_WHITE` for the highlight and a
 grey (black, in mono) pen with `R2_COPYPEN` for the shadow.
 
@@ -256,6 +271,26 @@ keeps one click to one pass over the edge.
 The opening half is the same operation as chording — and carries the same risk:
 if a flag is in the wrong place, opening its neighbours steps on a mine and
 ends the game, just as a chord would.
+
+### Double-click to find the next covered square
+
+On a field of a million squares the last few that are still covered can be
+anywhere, and hunting for them by dragging the window about is miserable.
+**Double-click an uncovered square** and the game goes to the next covered one
+in reading order — left to right, top to bottom, wrapping round at the end —
+bringing both the window and the mouse pointer to it.
+
+The window is only moved if the square is not already on screen; when it is
+moved the square is centred, so there is board visible all round it. Squares
+already carrying a **flag are passed over**: they are covered, but you have
+already said what you think is under them, and stopping at each would mean
+wading through every mine on the board to reach anything still undecided.
+Question marks are not skipped — those *are* still undecided.
+
+Only uncovered squares do this, so it never gets in the way of play:
+double-clicking a covered square opens it, exactly as two ordinary clicks
+always did. That also means the pointer finishes a jump sitting on a covered
+square — to go on to the one after, double-click an uncovered square nearby.
 
 ## Custom fields
 
