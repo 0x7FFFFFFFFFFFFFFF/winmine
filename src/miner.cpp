@@ -67,6 +67,15 @@
    side. */
 #define DXY_SURFACE_MAX 30000   /* largest client edge, in pixels     */
 
+/* The largest window, in device pixels, the desktop compositor will
+   still draw - see FWindowFitsSurface.  300 million pixels is about
+   1.2GB of surface, comfortably inside where it was measured to stop
+   drawing, and it is what holds the zoom down on a very large field.
+   Every field the game will build is displayable at some zoom: the
+   biggest allowed is 30,000 logical pixels a side, which at the 25%
+   floor is 7,500 device pixels a side - 56 million, well under. */
+#define CPX_WINDOW_MAX  300000000
+
 /*---------------------------------------------------------------------
     zoom - ctrl + wheel, as a percentage of the 1:1 layout
   -------------------------------------------------------------------*/
@@ -87,7 +96,7 @@
     window in device pixels, so it stays four screen pixels whatever
     the zoom is doing to everything else.
   -------------------------------------------------------------------*/
-#define PEEK_EDGE       2
+#define PEEK_EDGE       5       /* screen pixels, never scaled        */
 
 /*---------------------------------------------------------------------
     tile indices inside the 16-tile block bitmap
@@ -247,6 +256,11 @@ static HDC          g_hdcBack;
 static HBITMAP      g_hbmBack;
 static int          g_dxBack, g_dyBack;
 static int          g_fBackValid;
+static int          g_cBatch;              /* >0 while collecting     */
+static RECT         g_rcBatch;             /* what is waiting to go   */
+static int          g_fBatchRect;          /* g_rcBatch holds something */
+static int          g_fBatchField;         /* squares are pending     */
+static RECT         g_rcBatchField;        /* which ones, in squares  */
 
 /* --- space-bar panning, the hand tool ----------------------------- */
 static int          g_fSpaceDown;
@@ -265,6 +279,8 @@ static int          g_fCtrlDown;           /* tracked, not polled     */
 static int          g_fPeek;
 static int          g_xPeek = -1;
 static int          g_yPeek = -1;
+static int          g_fPeekOn;             /* the block is painted    */
+static RECT         g_rcPeekOn;            /* and this is where       */
 
 /* --- window metrics ---------------------------------------------- */
 static int          g_dxWindow;            /* SM_CXBORDER + 1         */
@@ -759,13 +775,35 @@ static void ClearFullscreenClaim(void)
     g_ptbl->lpVtbl->MarkFullscreenWindow(g_ptbl, g_hwnd, FALSE);
 }
 
+/* Would a window this big actually be drawn?
+
+   The desktop compositor gives every window an offscreen surface of
+   its own, and it will only go so large.  Past the limit nothing
+   fails in a way a program can see: the window is created, it is on
+   the taskbar, it answers messages and reports the size that was
+   asked for - it is simply never drawn, so the game runs on, entirely
+   correct and entirely invisible.  The limit belongs to the graphics
+   stack and there is nowhere to ask for it, so this keeps well inside
+   where it was measured to give out (about two gigabytes' worth). */
+static BOOL FWindowFitsSurface(int nZoom)
+{
+    int cx = MulDiv(g_dxClient, nZoom, 100);
+    int cy = MulDiv(g_dyClient, nZoom, 100);
+
+    if (cx <= 0 || cy <= 0)
+        return TRUE;
+    return cy <= CPX_WINDOW_MAX / cx;      /* divided, so never overflows */
+}
+
 /* There is no zoom ceiling of principle - a board larger than the
-   screen is what the space-bar pan is for.  The only limit is the
-   point where the window itself gets too big for the window manager
-   to place, so that is what is used. */
+   screen is what the space-bar pan is for.  Two practical ones do
+   apply: an edge the window manager will still place, and a surface
+   the compositor will still draw.  The second binds only on fields so
+   large that the window runs to hundreds of megapixels; on any
+   ordinary board the ceiling stays in the thousands of percent. */
 static int ZoomMax(void)
 {
-    int zx, zy;
+    int zx, zy, lo, hi;
 
     if (g_dxClient <= 0 || g_dyClient <= 0)
         return ZOOM_MIN;
@@ -773,7 +811,23 @@ static int ZoomMax(void)
     zy = MulDiv(DXY_ZOOM_MAX, 100, g_dyClient);
     if (zy < zx)
         zx = zy;
-    return (zx < ZOOM_MIN) ? ZOOM_MIN : zx;
+    if (zx < ZOOM_MIN)
+        return ZOOM_MIN;
+    if (FWindowFitsSurface(zx))
+        return zx;
+
+    /* the largest zoom whose window the compositor will still draw */
+    lo = ZOOM_MIN;
+    hi = zx;
+    while (lo < hi) {
+        int mid = lo + (hi - lo + 1) / 2;
+
+        if (FWindowFitsSurface(mid))
+            lo = mid;
+        else
+            hi = mid - 1;
+    }
+    return lo;
 }
 
 /* The zoom the game opens at.  The program asks Windows for real
@@ -832,6 +886,62 @@ static BOOL FEnsureBack(void)
     return TRUE;
 }
 
+/*---------------------------------------------------------------------
+    Batching the copies to the window.
+
+    Uncovering an empty area repaints every square it reaches, one at
+    a time, and each one used to be its own GetDC / BitBlt /
+    ReleaseDC.  On a large field a single click can open tens of
+    thousands of squares, which made the trip to the window, not the
+    drawing, the expensive part.  Between BeginBatch and EndBatch the
+    squares are still drawn onto the surface as they go, but the
+    copies are collected into one rectangle and sent over once.
+  -------------------------------------------------------------------*/
+static void DrawFieldRange(HDC hdc, int xFirst, int yFirst, int xLast,
+                           int yLast);
+
+static void BeginBatch(void)
+{
+    if (g_cBatch++ == 0) {
+        g_fBatchRect  = 0;
+        g_fBatchField = 0;
+    }
+}
+
+/* Draw the squares a batch has collected.  Anything that shows the
+   window mid-batch has to call this first, or it would show a surface
+   the squares have not reached yet. */
+static void FlushBatchField(void)
+{
+    int xPix, yPix, cx, cy;
+
+    if (!g_fBatchField)
+        return;
+    g_fBatchField = 0;
+    if (g_hdcBack == NULL)
+        return;
+
+    DrawFieldRange(g_hdcBack, g_rcBatchField.left, g_rcBatchField.top,
+                   g_rcBatchField.right, g_rcBatchField.bottom);
+
+    /* and note the ground they cover, so the copy to the window
+       takes them in */
+    xPix = g_rcBatchField.left * DX_BLK - 4;
+    yPix = g_rcBatchField.top  * DY_BLK + 39;
+    cx   = (g_rcBatchField.right  - g_rcBatchField.left + 1) * DX_BLK;
+    cy   = (g_rcBatchField.bottom - g_rcBatchField.top  + 1) * DY_BLK;
+    if (!g_fBatchRect) {
+        g_fBatchRect = 1;
+        g_rcBatch.left = xPix;      g_rcBatch.right  = xPix + cx;
+        g_rcBatch.top  = yPix;      g_rcBatch.bottom = yPix + cy;
+    } else {
+        if (xPix < g_rcBatch.left)        g_rcBatch.left   = xPix;
+        if (yPix < g_rcBatch.top)         g_rcBatch.top    = yPix;
+        if (xPix + cx > g_rcBatch.right)  g_rcBatch.right  = xPix + cx;
+        if (yPix + cy > g_rcBatch.bottom) g_rcBatch.bottom = yPix + cy;
+    }
+}
+
 /* copy one 1:1 rectangle of the surface onto the window, scaled */
 static void Present(int x, int y, int cx, int cy)
 {
@@ -839,6 +949,23 @@ static void Present(int x, int y, int cx, int cy)
 
     if (!g_hdcBack || g_hwnd == NULL)
         return;
+
+    if (g_cBatch > 0) {
+        /* plain comparisons, not UnionRect: this is on the path that
+           runs once per square turned over */
+        if (!g_fBatchRect) {
+            g_fBatchRect = 1;
+            g_rcBatch.left = x;  g_rcBatch.right  = x + cx;
+            g_rcBatch.top  = y;  g_rcBatch.bottom = y + cy;
+        } else {
+            if (x < g_rcBatch.left)            g_rcBatch.left   = x;
+            if (y < g_rcBatch.top)             g_rcBatch.top    = y;
+            if (x + cx > g_rcBatch.right)      g_rcBatch.right  = x + cx;
+            if (y + cy > g_rcBatch.bottom)     g_rcBatch.bottom = y + cy;
+        }
+        return;
+    }
+
     hdc = GetDC(g_hwnd);
     if (hdc == NULL)
         return;
@@ -860,6 +987,20 @@ static void Present(int x, int y, int cx, int cy)
     ReleaseDC(g_hwnd, hdc);
 }
 
+static void EndBatch(void)
+{
+    RECT rc;
+
+    if (g_cBatch <= 0 || --g_cBatch > 0)
+        return;
+    FlushBatchField();
+    if (!g_fBatchRect)
+        return;
+    rc = g_rcBatch;
+    g_fBatchRect = 0;
+    Present(rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top);
+}
+
 /*=====================================================================
     drawing
   =====================================================================*/
@@ -870,6 +1011,28 @@ static void DisplayBlk(int x, int y)
 
     if (!g_hdcBack)
         return;
+
+    /* Inside a batch the square is only noted, not drawn.  Uncovering
+       an empty area turns over every square it reaches, and a square
+       at a time costs one drawing call each - on a large field a
+       single click could spend seconds on it.  The block they cover
+       is redrawn in one pass at the end of the batch instead, where
+       the run-doubling in DrawFieldRow gets it for a fraction of the
+       calls: an opened area is mostly one blank tile repeated. */
+    if (g_cBatch > 0) {
+        if (!g_fBatchField) {
+            g_fBatchField = 1;
+            g_rcBatchField.left = g_rcBatchField.right  = x;
+            g_rcBatchField.top  = g_rcBatchField.bottom = y;
+        } else {
+            if (x < g_rcBatchField.left)   g_rcBatchField.left   = x;
+            if (x > g_rcBatchField.right)  g_rcBatchField.right  = x;
+            if (y < g_rcBatchField.top)    g_rcBatchField.top    = y;
+            if (y > g_rcBatchField.bottom) g_rcBatchField.bottom = y;
+        }
+        return;      /* the block of squares is copied over at the end */
+    }
+
     BitBlt(g_hdcBack, xPix, yPix, DX_BLK, DY_BLK,
            g_rghdcBlk[*PblkAt(x, y) & MASK_ICON], 0, 0, SRCCOPY);
     Present(xPix, yPix, DX_BLK, DY_BLK);
@@ -884,17 +1047,17 @@ static void DisplayBlk(int x, int y)
    is entirely one tile, so this walks runs of the same tile and draws
    each run once, then doubles it along itself: a run of n squares
    costs log2(n) calls rather than n.  A fresh row of 999 is ten. */
-static void DrawFieldRow(HDC hdc, int y, int yPix)
+static void DrawFieldRow(HDC hdc, int y, int yPix, int xFirst, int xLast)
 {
-    int x = 1;
+    int x = xFirst;
 
-    while (x <= g_cBlk) {
+    while (x <= xLast) {
         BYTE bTile = (BYTE)(*PblkAt(x, y) & MASK_ICON);
         int  xEnd  = x + 1;
         int  xPix  = X_FIELD + (x - 1) * DX_BLK;
         int  cRun, cDone;
 
-        while (xEnd <= g_cBlk &&
+        while (xEnd <= xLast &&
                (BYTE)(*PblkAt(xEnd, y) & MASK_ICON) == bTile)
             xEnd++;
         cRun = xEnd - x;
@@ -914,15 +1077,24 @@ static void DrawFieldRow(HDC hdc, int y, int yPix)
     }
 }
 
+/* redraw a block of squares, by rows */
+static void DrawFieldRange(HDC hdc, int xFirst, int yFirst, int xLast,
+                           int yLast)
+{
+    int y;
+
+    if (xFirst < 1) xFirst = 1;
+    if (yFirst < 1) yFirst = 1;
+    if (xLast > g_cBlk) xLast = g_cBlk;
+    if (yLast > g_cRow) yLast = g_cRow;
+
+    for (y = yFirst; y <= yLast; y++)
+        DrawFieldRow(hdc, y, Y_FIELD + (y - 1) * DY_BLK, xFirst, xLast);
+}
+
 static void DrawField(HDC hdc)
 {
-    int y, yPix;
-
-    yPix = Y_FIELD;
-    for (y = 1; y <= g_cRow; y++) {
-        DrawFieldRow(hdc, y, yPix);
-        yPix += DY_BLK;
-    }
+    DrawFieldRange(hdc, 1, 1, g_cBlk, g_cRow);
 }
 
 static void DisplayField(void)
@@ -1179,6 +1351,13 @@ static void AdjustWindow(UINT wFlags)
 
     g_dxClient = g_cBlk * DX_BLK + DX_WINDOW;
     g_dyClient = g_cRow * DY_BLK + DY_WINDOW;
+
+    /* A new field changes what the zoom is allowed to be: going from
+       a small board to a very large one at the same magnification can
+       ask for a window past what the compositor will draw, and the
+       window would simply stop appearing.  Bring the zoom back inside
+       the ceiling rather than letting that happen. */
+    g_nZoom = ClampInt(g_nZoom, ZOOM_MIN, ZoomMax());
 
     /* Pull the window back on screen if it hangs off the edge - but
        only when it would actually fit.  A board wider or taller than
@@ -1917,7 +2096,7 @@ static void SweepRegion(int x, int y)
 
 /* What a left click does to the square under the cursor.  Shared by
    the button-up handler and by the auto-repeat while it is held. */
-static void DoClickAction(void)
+static void DoClickActionInner(void)
 {
     BYTE blk;
 
@@ -1942,6 +2121,17 @@ static void DoClickAction(void)
     } else if ((blk & MASK_ICON) != BLK_BOMBFLAG) {
         StepSquare(g_xCur, g_yCur);
     }
+}
+
+/* Everything one click can set off - a flood fill, a chord, a sweep
+   along the edge of an uncovered area, and the end of the game that
+   any of them may bring - draws through here, so one click costs one
+   copy to the window however many squares it turns over. */
+static void DoClickAction(void)
+{
+    BeginBatch();
+    DoClickActionInner();
+    EndBatch();
 }
 
 /* the clock starts on the first square the player actually opens */
@@ -2409,11 +2599,48 @@ static void DoXyzzy(WPARAM wParam, LPARAM lParam)
     device pixels, deliberately outside the zoomed surface, so it stays
     exactly four screen pixels however far the interface is zoomed in.
   -------------------------------------------------------------------*/
-static void PeekRect(LPRECT prc)
+/* Where the block goes: the bottom-left corner of the square under
+   the cursor, in real screen pixels.  It used to sit in the corner of
+   the window, which was fine while the window was small - but a board
+   can be far wider than the screen, and then the corner of the window
+   is off the edge of it and the answer is somewhere the player cannot
+   see.  Following the cursor keeps it under their eye wherever on the
+   board they are.  The size stays in device pixels, so the block is
+   the same five-by-five patch of the monitor at any zoom. */
+static BOOL FPeekRect(LPRECT prc, int x, int y)
 {
-    GetClientRect(g_hwnd, prc);
-    prc->top  = prc->bottom - PEEK_EDGE;
-    prc->right = prc->left + PEEK_EDGE;
+    int xDev, yDev;
+
+    if (g_hwnd == NULL || x < 1 || y < 1 || x > g_cBlk || y > g_cRow)
+        return FALSE;
+
+    xDev = LogToDev(x * DX_BLK - 4);            /* the square's left  */
+    yDev = LogToDev(y * DY_BLK + 39 + DY_BLK);  /* and its bottom     */
+
+    prc->left   = xDev;
+    prc->right  = xDev + PEEK_EDGE;
+    prc->bottom = yDev;
+    prc->top    = yDev - PEEK_EDGE;
+    return TRUE;
+}
+
+/* Put back whatever the board had where the block was.  The block is
+   placed in device pixels and so need not line up with the 1:1
+   surface underneath; the logical rectangle covering it is taken a
+   pixel wider all round so no edge of it can survive. */
+static void ErasePeek(void)
+{
+    int xl, yl, xr, yb;
+
+    if (!g_fPeekOn || g_hwnd == NULL)
+        return;
+    g_fPeekOn = 0;
+
+    xl = ClampInt(DevToLog(g_rcPeekOn.left)   - 1, 0, g_dxClient);
+    yl = ClampInt(DevToLog(g_rcPeekOn.top)    - 1, 0, g_dyClient);
+    xr = ClampInt(DevToLog(g_rcPeekOn.right)  + 2, xl + 1, g_dxClient);
+    yb = ClampInt(DevToLog(g_rcPeekOn.bottom) + 2, yl + 1, g_dyClient);
+    Present(xl, yl, xr - xl, yb - yl);
 }
 
 static void DrawPeek(void)
@@ -2424,13 +2651,12 @@ static void DrawPeek(void)
 
     if (!g_fPeek || g_hwnd == NULL || g_rgBlk == NULL)
         return;
-    if (g_xPeek < 1 || g_yPeek < 1 || g_xPeek > g_cBlk || g_yPeek > g_cRow)
+    if (!FPeekRect(&rc, g_xPeek, g_yPeek))
         return;
 
     hdc = GetDC(g_hwnd);
     if (hdc == NULL)
         return;
-    PeekRect(&rc);
     hbr = CreateSolidBrush((*PblkAt(g_xPeek, g_yPeek) & MASK_BOMB)
                            ? RGB(255, 0, 0) : RGB(0, 255, 0));
     if (hbr) {
@@ -2438,21 +2664,29 @@ static void DrawPeek(void)
         DeleteObject(hbr);
     }
     ReleaseDC(g_hwnd, hdc);
+    g_rcPeekOn = rc;
+    g_fPeekOn  = 1;
 }
 
 static void UpdatePeek(LPARAM lParam)
 {
+    int x, y;
+
     if (!g_fPeek)
         return;
-    g_xPeek = XFromLp(lParam);
-    g_yPeek = YFromLp(lParam);
+    x = XFromLp(lParam);
+    y = YFromLp(lParam);
+    if (x == g_xPeek && y == g_yPeek && g_fPeekOn)
+        return;                    /* same square - leave it alone */
+
+    ErasePeek();                   /* lift it off the square it was on */
+    g_xPeek = x;
+    g_yPeek = y;
     DrawPeek();
 }
 
 static void TogglePeek(HWND hwnd)
 {
-    RECT rc;
-
     g_fPeek = !g_fPeek;
     if (g_fPeek) {
         POINT pt;
@@ -2462,9 +2696,7 @@ static void TogglePeek(HWND hwnd)
         }
         DrawPeek();
     } else {
-        /* put the corner back the way it was */
-        PeekRect(&rc);
-        InvalidateRect(hwnd, &rc, FALSE);
+        ErasePeek();            /* put the square back as it was */
     }
 }
 
@@ -2490,7 +2722,14 @@ static LRESULT CALLBACK MineWndProc(HWND hwnd, UINT msg, WPARAM wParam,
         if (FEnsureBack()) {
             if (!g_fBackValid) {
                 DrawScreen(g_hdcBack);
-                g_fBackValid = 1;
+                g_fBackValid  = 1;
+                g_fBatchField = 0;   /* just drawn, by other means */
+            } else {
+                /* a dialog can run its own message loop in the middle
+                   of a batch - the end of a game asking for a name,
+                   say - so make sure the squares are on the surface
+                   before any of it is shown */
+                FlushBatchField();
             }
             if (g_nZoom == 100) {
                 BitBlt(hdc, ps.rcPaint.left, ps.rcPaint.top,
@@ -2498,13 +2737,35 @@ static LRESULT CALLBACK MineWndProc(HWND hwnd, UINT msg, WPARAM wParam,
                        ps.rcPaint.bottom - ps.rcPaint.top,
                        g_hdcBack, ps.rcPaint.left, ps.rcPaint.top, SRCCOPY);
             } else {
+                /* Only the part that needs repainting.  This used to
+                   stretch the whole interface across every time, which
+                   on a large field meant a quarter of a second of work
+                   to put back a single square.  The logical rectangle
+                   is taken a pixel wide either side so that rounding
+                   cannot leave a seam, and the destination is derived
+                   from it so the scaling lines up exactly with the
+                   piecemeal copies Present makes. */
+                int xl = DevToLog(ps.rcPaint.left);
+                int yl = DevToLog(ps.rcPaint.top);
+                int xr = DevToLog(ps.rcPaint.right) + 1;
+                int yb = DevToLog(ps.rcPaint.bottom) + 1;
+                int xd, yd;
+
+                xl = ClampInt(xl - 1, 0, g_dxClient);
+                yl = ClampInt(yl - 1, 0, g_dyClient);
+                xr = ClampInt(xr + 1, xl + 1, g_dxClient);
+                yb = ClampInt(yb + 1, yl + 1, g_dyClient);
+                xd = LogToDev(xl);
+                yd = LogToDev(yl);
+
                 SetStretchBltMode(hdc, COLORONCOLOR);
-                StretchBlt(hdc, 0, 0,
-                           LogToDev(g_dxClient), LogToDev(g_dyClient),
-                           g_hdcBack, 0, 0, g_dxClient, g_dyClient, SRCCOPY);
+                StretchBlt(hdc, xd, yd,
+                           LogToDev(xr) - xd, LogToDev(yb) - yd,
+                           g_hdcBack, xl, yl, xr - xl, yb - yl, SRCCOPY);
             }
         }
         EndPaint(hwnd, &ps);
+        g_fPeekOn = 0;          /* the repaint took the block with it */
         DrawPeek();
         return 0;
     }
@@ -2917,6 +3178,15 @@ static int RunApp(HINSTANCE hInst, int nCmdShow)
 
     g_dxClient = g_cBlk * DX_BLK + DX_WINDOW;
     g_dyClient = g_cRow * DY_BLK + DY_WINDOW;
+
+    /* The opening zoom follows the display's own scale, which on a
+       200% monitor doubles the window - enough, on a large saved
+       field, to put it past what the compositor will draw.  The
+       field size is only known now, so this is the first point the
+       ceiling can be applied; without it the game came up invisible
+       and, because the field is remembered, came up invisible again
+       every time after that. */
+    g_nZoom = ClampInt(g_nZoom, ZOOM_MIN, ZoomMax());
 
     SetRect(&rc, 0, 0, LogToDev(g_dxClient), LogToDev(g_dyClient));
     AdjustWindowRect(&rc, WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,

@@ -39,9 +39,24 @@ produces `winmine.exe` next to `build.cmd`.
 **Ctrl + mouse wheel** zooms the whole interface in 25% steps — wheel up
 to magnify, wheel down to shrink. There is no zoom-in ceiling of
 principle: keep going and the window simply grows past the edge of the
-screen, which is what the pan below is for. The only stop is the point
-where the window gets too large for the window manager to place at all
-(a 30,000 pixel edge — thousands of percent on any normal board).
+screen, which is what the pan below is for. Two practical ceilings do
+apply, and on any ordinary board both sit in the thousands of percent:
+
+* an edge the window manager will still place — 30,000 pixels;
+* a **surface the desktop compositor will still draw**. Every window
+  gets an offscreen surface of its own and the graphics stack will only
+  go so large. Past the limit nothing fails in a way a program can
+  detect: the window is created, it appears on the taskbar, it answers
+  messages and reports the size it asked for — it is simply never
+  drawn. The game would run on, entirely correct and entirely
+  invisible. So the zoom is held to a budget of 300 million device
+  pixels, well inside where the limit was measured, and on a very large
+  field the game quietly opens further out rather than not at all.
+
+That second ceiling binds only on fields big enough for the window to
+run to hundreds of megapixels. A 999 × 999 field opens at about 108%
+rather than the display's own scale, and cannot be magnified much past
+that; a board of ordinary size is unaffected.
 Everything scales together: the artwork, the LED digits and the
 one-pixel 3D edges. The interface is composed once at 1:1 onto an
 offscreen surface and then stretched to the window with
@@ -139,7 +154,25 @@ tile — so each row is drawn as **runs of the same tile**: the run is
 drawn once and then doubled along itself, which costs `log2(n)` calls
 for a run of `n` squares instead of `n`. A fresh row of 999 squares
 takes ten calls rather than 999, and the same field now composes in
-about 250 ms. The output is identical either way, down to the pixel. The 3D edges all come from one routine
+about 250 ms. The output is identical either way, down to the pixel.
+
+Two more things follow from the same arithmetic, and matter far more in
+play than composing does:
+
+* **uncovering is batched.** A click can set off a flood fill, a chord,
+  a sweep along the edge of an uncovered area, and the end of the game
+  that any of them may bring. Every square turned over used to be drawn
+  and copied to the window on its own — one click on a large field could
+  spend *seconds* on it. Now the squares are noted as they are turned
+  over and the block they cover is drawn in one run-doubled pass and
+  copied across once. A single click that opens all 998,001 squares of a
+  999 × 999 field went from **22.9 seconds to 0.3**; at 500 × 500, from
+  6.3 seconds to 0.09.
+* **repainting honours the update region at every zoom.** Away from
+  1:1 the window used to be redrawn whole on any repaint, so putting
+  back one square cost a stretch of the entire interface — about a
+  quarter of a second on a large field. Only the part that actually
+  needs repainting is copied now, which is under a millisecond. The 3D edges all come from one routine
 that walks `cThick` nested rectangles, using `R2_WHITE` for the highlight and a
 grey (black, in mono) pen with `R2_COPYPEN` for the shadow.
 
@@ -281,15 +314,23 @@ next thing that repaints that corner.
 
 ## The Ctrl+T peek
 
-**Ctrl + T** toggles a second, less coy cheat. While it is on, the four
-pixels in the very bottom-left corner of the window answer the same
-question XYZZY does about the square under the cursor: **red** for a
-mine, **green** for clear. Press Ctrl + T again to turn it off and the
-corner goes back to normal.
+**Ctrl + T** toggles a second, less coy cheat. While it is on, a small
+block answers the same question XYZZY does about the square under the
+cursor: **red** for a mine, **green** for clear. Press Ctrl + T again to
+turn it off.
 
-The block is painted straight onto the window in device pixels rather
-than onto the zoomed surface, so it stays a 2 × 2 square of real screen
-pixels no matter how far the interface is zoomed in.
+The block sits in the **bottom-left corner of the square the cursor is
+on**, and follows the cursor around the board. It used to live in the
+bottom-left corner of the window, which was fine while the window was
+small — but a board can be far wider than the screen, and then the
+corner of the window is off the edge of it and the answer is somewhere
+the player cannot see.
+
+It is painted straight onto the window in device pixels rather than
+onto the zoomed surface, so it stays a **5 × 5 square of real screen
+pixels** however far the interface is zoomed in. Moving to another
+square lifts it off the old one first, putting back whatever the board
+had underneath.
 
 ## Building
 
